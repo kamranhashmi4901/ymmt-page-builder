@@ -37,6 +37,7 @@ model YmmtUpload {
   id                  String   @id @default(cuid())
   shop                String
   fileName            String
+  fileHash            String
   totalRecords        Int
   totalYears          Int
   totalMakes          Int
@@ -50,6 +51,7 @@ model YmmtUpload {
 
   records YmmtRecord[]
 
+  @@unique([shop, fileHash])
   @@index([shop])
 }
 
@@ -64,8 +66,51 @@ model YmmtRecord {
   compatible   String?
   manufacturer String?
 
+  selected       Boolean @default(false)
+  duplicate      Boolean @default(false)
+  proposedHandle String?
+
   upload YmmtUpload @relation(fields: [uploadId], references: [id], onDelete: Cascade)
 
   @@index([uploadId])
   @@index([year, make, model])
+}
+
+model YmmtJob {
+  id            String   @id @default(cuid())
+  shop          String
+  uploadId      String
+  type          String   @default("create")
+  status        String   @default("pending")
+
+  total         Int      @default(0)
+  processed     Int      @default(0)
+  created       Int      @default(0)
+  skipped       Int      @default(0)
+  failed        Int      @default(0)
+
+  startedAt     DateTime?
+  finishedAt    DateTime?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  logs          YmmtJobLog[]
+
+  @@index([shop])
+  @@index([uploadId])
+  @@index([status])
+}
+
+model YmmtJobLog {
+  id        String   @id @default(cuid())
+  jobId     String
+  level     String   @default("info")
+  message   String
+  handle    String?
+  recordId  String?
+  createdAt DateTime @default(now())
+
+  job YmmtJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId])
 }

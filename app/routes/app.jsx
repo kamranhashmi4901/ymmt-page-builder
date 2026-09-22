@@ -16,8 +16,11 @@ export default function App() {
   return (
     <AppProvider embedded apiKey={apiKey}>
       <s-app-nav>
-        <s-link href="/app">Home</s-link>
-        <s-link href="/app/upload">Upload YMMT</s-link>
+        <s-link href="/app">Dashboard</s-link>
+        <s-link href="/app/upload">Create YMMT Pages</s-link>
+        <s-link href="/app/manage">Manage Pages</s-link>
+        <s-link href="/app/seo">SEO Meta</s-link>
+        <s-link href="/app/google-feed">Google Feed</s-link>
       </s-app-nav>
       <Outlet />
     </AppProvider>

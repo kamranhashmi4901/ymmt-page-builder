@@ -1,0 +1,26 @@
+client_id = "2e83299418781073617c27b7ead34b48"
+name = "YMMT Page Builder"
+application_url = "https://example.com"
+embedded = true
+
+[webhooks]
+api_version = "2026-10"
+
+[[webhooks.subscriptions]]
+uri = "/webhooks/app/scopes_update"
+topics = [ "app/scopes_update" ]
+
+[[webhooks.subscriptions]]
+uri = "/webhooks/app/uninstalled"
+topics = [ "app/uninstalled" ]
+
+[access_scopes]
+scopes = "read_content,read_metaobjects,read_products,write_content,write_metaobject_definitions,write_metaobjects,write_products"
+
+[auth]
+redirect_urls = [
+  "https://example.com/auth/callback"
+]
+
+[build]
+automatically_update_urls_on_dev = true

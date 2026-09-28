@@ -77,24 +77,24 @@ model YmmtRecord {
 }
 
 model YmmtJob {
-  id            String   @id @default(cuid())
-  shop          String
-  uploadId      String
-  type          String   @default("create")
-  status        String   @default("pending")
+  id       String @id @default(cuid())
+  shop     String
+  uploadId String
+  type     String @default("create")
+  status   String @default("pending")
 
-  total         Int      @default(0)
-  processed     Int      @default(0)
-  created       Int      @default(0)
-  skipped       Int      @default(0)
-  failed        Int      @default(0)
+  total     Int @default(0)
+  processed Int @default(0)
+  created   Int @default(0)
+  skipped   Int @default(0)
+  failed    Int @default(0)
 
-  startedAt     DateTime?
-  finishedAt    DateTime?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  startedAt  DateTime?
+  finishedAt DateTime?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
 
-  logs          YmmtJobLog[]
+  logs YmmtJobLog[]
 
   @@index([shop])
   @@index([uploadId])
@@ -113,4 +113,49 @@ model YmmtJobLog {
   job YmmtJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
 
   @@index([jobId])
+}
+
+model PageActionSession {
+  id         String @id @default(cuid())
+  shop       String
+  actionType String
+  status     String @default("pending")
+
+  totalPages   Int @default(0)
+  successCount Int @default(0)
+  failedCount  Int @default(0)
+
+  filterSnapshot String?
+  createdAt      DateTime  @default(now())
+  completedAt    DateTime?
+  rolledBackAt   DateTime?
+
+  changes PageChangeLog[]
+
+  @@index([shop])
+  @@index([createdAt])
+}
+
+model PageChangeLog {
+  id        String @id @default(cuid())
+  sessionId String
+
+  shopifyPageId String
+  handle        String
+  action        String
+
+  beforeData String?
+  afterData  String?
+
+  status       String  @default("pending")
+  errorMessage String?
+
+  createdAt    DateTime  @default(now())
+  rolledBackAt DateTime?
+
+  session PageActionSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId])
+  @@index([shopifyPageId])
+  @@index([handle])
 }

@@ -1,27 +1,30 @@
+# Learn more about configuring your app at https://shopify.dev/docs/apps/tools/cli/configuration
+
 client_id = "2e83299418781073617c27b7ead34b48"
 name = "YMMT Page Builder"
 application_url = "https://ymmt-page-builder-production.up.railway.app"
 embedded = true
 
-[access_scopes]
-scopes = "write_products,read_products,read_content,write_content,write_metaobjects,read_metaobjects,write_metaobject_definitions"
+[build]
+automatically_update_urls_on_dev = false
+include_config_on_deploy = true
 
 [webhooks]
 api_version = "2026-10"
 
-[[webhooks.subscriptions]]
-uri = "/webhooks/app/uninstalled"
-topics = [ "app/uninstalled" ]
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/scopes_update"
+  topics = [ "app/scopes_update" ]
 
-[[webhooks.subscriptions]]
-uri = "/webhooks/app/scopes_update"
-topics = [ "app/scopes_update" ]
+  [[webhooks.subscriptions]]
+  uri = "/webhooks/app/uninstalled"
+  topics = [ "app/uninstalled" ]
+
+[access_scopes]
+# Learn more at https://shopify.dev/docs/apps/tools/cli/configuration#access_scopes
+scopes = "read_content,read_metaobjects,read_products,write_content,write_metaobject_definitions,write_metaobjects,write_products"
 
 [auth]
 redirect_urls = [
   "https://ymmt-page-builder-production.up.railway.app/auth/callback"
 ]
-
-[build]
-include_config_on_deploy = true
-automatically_update_urls_on_dev = false

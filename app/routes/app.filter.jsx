@@ -114,7 +114,7 @@ const steps = [
     icon: UploadIcon,
   },
   {
-    label: "Select Product",
+    label: "Select Products",
     icon: ProductIcon,
   },
   {
@@ -167,6 +167,11 @@ const tableCellStyle = {
 export default function FilterPreview() {
   const { upload, filters, options, records, total, totalPages, page } =
     useLoaderData();
+
+  const selectedProductCount = upload.sourceProducts?.length || 0;
+
+  const proposedPageCount =
+    total * (selectedProductCount > 0 ? selectedProductCount : 1);
 
   const hasFilters =
     filters.year ||
@@ -380,9 +385,13 @@ export default function FilterPreview() {
                 fontSize: "13px",
               }}
             >
-              Product:{" "}
+              Products:{" "}
               <strong>
-                {upload.sourceProductHandle || "No product suffix"}
+                {upload.sourceProducts?.length > 0
+                  ? upload.sourceProducts
+                      .map((product) => product.handle)
+                      .join(", ")
+                  : "No product suffix"}
               </strong>
             </div>
           </div>
@@ -674,7 +683,9 @@ export default function FilterPreview() {
             }}
           >
             <s-icon type="view" />
-            <strong>{`Preview (${total} records)`}</strong>
+            <strong>
+              Preview ({total} vehicles → {proposedPageCount} proposed pages)
+            </strong>
           </div>
           {records.length > 0 ? (
             <div
@@ -724,42 +735,78 @@ export default function FilterPreview() {
                 </thead>
 
                 <tbody>
-                  {records.map((record) => {
-                    const handle = buildYMMTPageHandle(
-                      record,
-                      upload.sourceProductHandle,
-                    );
+                  {records.flatMap((record) => {
+                    /*
+                     * If products were selected:
+                     *
+                     * vehicle × each selected product
+                     *
+                     * If user selected "No Product Suffix":
+                     * create one combination with null.
+                     */
+                    const sourceProducts =
+                      upload.sourceProducts?.length > 0
+                        ? upload.sourceProducts
+                        : [null];
 
-                    return (
-                      <tr key={record.id}>
-                        <td style={tableCellStyle}>{record.year}</td>
+                    return sourceProducts.map((product) => {
+                      const sourceProductHandle = product?.handle || null;
 
-                        <td style={tableCellStyle}>{record.make}</td>
+                      const handle = buildYMMTPageHandle(
+                        record,
+                        sourceProductHandle,
+                      );
 
-                        <td style={tableCellStyle}>{record.model}</td>
+                      const rowKey = [
+                        record.id,
+                        sourceProductHandle || "no-product",
+                      ].join("-");
 
-                        <td style={tableCellStyle}>{record.trim || "—"}</td>
+                      return (
+                        <tr key={rowKey}>
+                          <td style={tableCellStyle}>{record.year}</td>
 
-                        <td style={tableCellStyle}>
-                          {record.manufacturer || "—"}
-                        </td>
+                          <td style={tableCellStyle}>{record.make}</td>
 
-                        <td style={tableCellStyle}>
-                          {record.compatible || "—"}
-                        </td>
+                          <td style={tableCellStyle}>{record.model}</td>
 
-                        <td style={tableCellStyle}>
-                          <code
-                            style={{
-                              fontSize: "12px",
-                              wordBreak: "break-word",
-                            }}
-                          >
-                            {handle}
-                          </code>
-                        </td>
-                      </tr>
-                    );
+                          <td style={tableCellStyle}>{record.trim || "—"}</td>
+
+                          <td style={tableCellStyle}>
+                            {record.manufacturer || "—"}
+                          </td>
+
+                          <td style={tableCellStyle}>
+                            {record.compatible || "—"}
+                          </td>
+
+                          <td style={tableCellStyle}>
+                            <div>
+                              <code
+                                style={{
+                                  fontSize: "12px",
+                                  wordBreak: "break-word",
+                                }}
+                              >
+                                {handle}
+                              </code>
+
+                              {sourceProductHandle && (
+                                <div
+                                  style={{
+                                    marginTop: "4px",
+                                    fontSize: "11px",
+                                    color: "#777",
+                                  }}
+                                >
+                                  {sourceProductHandle}
+                                </div>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    });
                   })}
                 </tbody>
               </table>
@@ -879,7 +926,7 @@ export default function FilterPreview() {
                 fontWeight: "650",
               }}
             >
-              Continue to Review ({total}) →
+              Continue to Review ({proposedPageCount} pages) →
             </Link>
           )}
         </div>

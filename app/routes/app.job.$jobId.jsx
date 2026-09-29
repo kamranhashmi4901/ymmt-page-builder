@@ -253,7 +253,7 @@ export default function JobProgress() {
                 color: "#616161",
               }}
             >
-              Total
+              Total Pages
             </div>
 
             <div
@@ -274,7 +274,7 @@ export default function JobProgress() {
                 color: "#616161",
               }}
             >
-              Processed
+              Processed Pages
             </div>
 
             <div

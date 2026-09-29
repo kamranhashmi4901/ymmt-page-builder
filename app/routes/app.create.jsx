@@ -12,9 +12,20 @@ import { createYMMTJob, startYMMTJobProcessor } from "../lib/ymmt-jobs.server";
 
 import { authenticate } from "../shopify.server";
 import { getYMMTUpload } from "../lib/ymmt-uploads.server";
+import { getExistingPageHandles } from "../lib/shopify-pages.server";
+import { buildYMMTPageHandle } from "../lib/ymmt-pages";
+
+function buildRecordHandles(record, upload) {
+  const sourceProducts =
+    upload.sourceProducts?.length > 0 ? upload.sourceProducts : [null];
+
+  return sourceProducts.map((product) =>
+    buildYMMTPageHandle(record, product?.handle || null),
+  );
+}
 
 export const loader = async ({ request }) => {
-  const { session } = await authenticate.admin(request);
+  const { session, admin } = await authenticate.admin(request);
 
   const url = new URL(request.url);
   const uploadId = url.searchParams.get("uploadId");
@@ -36,7 +47,7 @@ export const loader = async ({ request }) => {
     });
   }
 
-  const selectedCount = await db.ymmtRecord.count({
+  const selectedRecords = await db.ymmtRecord.findMany({
     where: {
       uploadId,
       selected: true,
@@ -44,9 +55,30 @@ export const loader = async ({ request }) => {
     },
   });
 
+  const existingHandles = await getExistingPageHandles(admin);
+
+  let pageCount = 0;
+  let skippedExistingCount = 0;
+
+  for (const record of selectedRecords) {
+    const handles = buildRecordHandles(record, upload);
+
+    for (const handle of handles) {
+      if (existingHandles.has(handle)) {
+        skippedExistingCount += 1;
+      } else {
+        pageCount += 1;
+      }
+    }
+  }
+
   return {
     upload,
-    selectedCount,
+    selectedCount: selectedRecords.length,
+    pageCount,
+    skippedExistingCount,
+    productCount:
+      upload.sourceProducts?.length > 0 ? upload.sourceProducts.length : 1,
   };
 };
 
@@ -91,26 +123,11 @@ import {
 } from "@shopify/polaris-icons";
 
 const steps = [
-  {
-    label: "Upload Data",
-    icon: UploadIcon,
-  },
-  {
-    label: "Select Product",
-    icon: ProductIcon,
-  },
-  {
-    label: "Filter & Preview",
-    icon: FilterIcon,
-  },
-  {
-    label: "Review & Select",
-    icon: CheckCircleIcon,
-  },
-  {
-    label: "Create Pages",
-    icon: PageAddIcon,
-  },
+  { label: "Upload Data", icon: UploadIcon },
+  { label: "Select Products", icon: ProductIcon },
+  { label: "Filter & Preview", icon: FilterIcon },
+  { label: "Review & Select", icon: CheckCircleIcon },
+  { label: "Create Pages", icon: PageAddIcon },
 ];
 
 const summaryCardStyle = {
@@ -121,7 +138,14 @@ const summaryCardStyle = {
 };
 
 export default function CreatePages() {
-  const { upload, selectedCount } = useLoaderData();
+  const {
+    upload,
+    selectedCount,
+    pageCount,
+    skippedExistingCount,
+    productCount,
+  } = useLoaderData();
+
   const navigation = useNavigation();
 
   const isCreating = navigation.state === "submitting";
@@ -135,7 +159,6 @@ export default function CreatePages() {
           gap: "24px",
         }}
       >
-        {/* Workflow */}
         <div
           style={{
             display: "flex",
@@ -146,13 +169,7 @@ export default function CreatePages() {
         >
           {steps.map((step, index) => {
             const Icon = step.icon;
-
             const isActive = index === 4;
-            // Upload = 0
-            // Product = 1
-            // Filter = 2
-            // Review = 3
-            // Create = 4
 
             return (
               <div
@@ -167,28 +184,16 @@ export default function CreatePages() {
                   style={{
                     width: "160px",
                     height: "40px",
-
                     display: "flex",
                     alignItems: "center",
                     justifyContent: "center",
                     gap: "7px",
-
-                    padding: "0 10px",
-                    boxSizing: "border-box",
-
                     borderRadius: "9px",
                     border: isActive
                       ? "1px solid #303030"
                       : "1px solid #d8d8d8",
-
                     background: isActive ? "#303030" : "#ffffff",
-
                     color: isActive ? "#ffffff" : "#616161",
-
-                    fontSize: "14px",
-                    fontWeight: isActive ? "650" : "500",
-
-                    whiteSpace: "nowrap",
                   }}
                 >
                   <span
@@ -197,7 +202,6 @@ export default function CreatePages() {
                       height: "16px",
                       display: "inline-flex",
                       fill: isActive ? "#ffffff" : "#616161",
-                      flexShrink: 0,
                     }}
                   >
                     <Icon />
@@ -206,42 +210,21 @@ export default function CreatePages() {
                   <span>{step.label}</span>
                 </div>
 
-                {index < steps.length - 1 && (
-                  <span
-                    style={{
-                      color: "#8a8a8a",
-                      fontSize: "14px",
-                      lineHeight: 1,
-                    }}
-                  >
-                    →
-                  </span>
-                )}
+                {index < steps.length - 1 && <span>→</span>}
               </div>
             );
           })}
         </div>
 
         <s-section>
-          <span
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: "7px",
-            }}
-          >
-            <s-icon type="check-circle" />
-            <strong>Final Confirmation</strong>
-          </span>
+          <strong>Final Confirmation</strong>
+
           <s-paragraph>
-            Review the final selection before starting page creation. Once
-            started, the job will continue in the background and you can monitor
-            progress, logs, skipped pages and failures from the Job Progress
-            screen.
+            Review the final vehicle and product combinations before starting
+            page creation.
           </s-paragraph>
         </s-section>
 
-        {/* Summary cards */}
         <div
           style={{
             display: "grid",
@@ -250,36 +233,35 @@ export default function CreatePages() {
           }}
         >
           <div style={summaryCardStyle}>
-            <div
-              style={{
-                color: "#616161",
-                fontSize: "13px",
-              }}
-            >
-              Selected Pages
-            </div>
-
-            <div
-              style={{
-                fontSize: "28px",
-                fontWeight: "700",
-                marginTop: "5px",
-              }}
-            >
+            <div>Selected Vehicles</div>
+            <div style={{ fontSize: "28px", fontWeight: "700" }}>
               {selectedCount}
             </div>
           </div>
 
           <div style={summaryCardStyle}>
-            <div
-              style={{
-                color: "#616161",
-                fontSize: "13px",
-              }}
-            >
-              Source File
+            <div>Selected Products</div>
+            <div style={{ fontSize: "28px", fontWeight: "700" }}>
+              {productCount}
             </div>
+          </div>
 
+          <div style={summaryCardStyle}>
+            <div>New Pages to Create</div>
+            <div style={{ fontSize: "28px", fontWeight: "700" }}>
+              {pageCount}
+            </div>
+          </div>
+
+          <div style={summaryCardStyle}>
+            <div>Existing Pages Skipped</div>
+            <div style={{ fontSize: "28px", fontWeight: "700" }}>
+              {skippedExistingCount}
+            </div>
+          </div>
+
+          <div style={summaryCardStyle}>
+            <div>Source File</div>
             <div
               style={{
                 marginTop: "7px",
@@ -290,30 +272,41 @@ export default function CreatePages() {
               {upload.fileName}
             </div>
           </div>
-
-          <div style={summaryCardStyle}>
-            <div
-              style={{
-                color: "#616161",
-                fontSize: "13px",
-              }}
-            >
-              Product Handle
-            </div>
-
-            <div
-              style={{
-                marginTop: "7px",
-                fontWeight: "650",
-                wordBreak: "break-word",
-              }}
-            >
-              {upload.sourceProductHandle || "No product suffix"}
-            </div>
-          </div>
         </div>
 
-        {/* Safety notice */}
+        <s-section>
+          <strong>Products</strong>
+
+          <div
+            style={{
+              marginTop: "10px",
+              display: "flex",
+              flexWrap: "wrap",
+              gap: "8px",
+            }}
+          >
+            {upload.sourceProducts?.length > 0 ? (
+              upload.sourceProducts.map((product) => (
+                <span
+                  key={product.id}
+                  style={{
+                    padding: "7px 10px",
+                    border: "1px solid #d8d8d8",
+                    borderRadius: "999px",
+                    background: "#f6f6f7",
+                    fontSize: "12px",
+                    fontWeight: "600",
+                  }}
+                >
+                  {product.handle}
+                </span>
+              ))
+            ) : (
+              <span>No product suffix</span>
+            )}
+          </div>
+        </s-section>
+
         <div
           style={{
             border: "1px solid #e6cf8b",
@@ -322,111 +315,31 @@ export default function CreatePages() {
             padding: "16px",
           }}
         >
-          <div
-            style={{
-              fontWeight: "650",
-              marginBottom: "6px",
-            }}
-          >
-            Ready to create
-          </div>
+          <strong>Ready to create</strong>
 
           <div
             style={{
+              marginTop: "6px",
               color: "#616161",
               lineHeight: "1.5",
               fontSize: "14px",
             }}
           >
-            Only the pages selected during Review will be processed. Existing
-            page handles are checked again during creation and will be skipped
-            if they already exist.
+            Each selected vehicle is combined with every selected product.
+            Existing handles are checked again and skipped instead of
+            overwritten.
           </div>
         </div>
 
-        {/* What happens next */}
-        <s-section>
-          <span
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: "7px",
-            }}
-          >
-            <s-icon type="arrow-right" />
-            <strong>What Happens Next</strong>
-          </span>
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))",
-              gap: "14px",
-            }}
-          >
-            <div>
-              <strong>1. Job starts</strong>
-              <div
-                style={{
-                  marginTop: "4px",
-                  color: "#616161",
-                  fontSize: "13px",
-                  lineHeight: "1.5",
-                }}
-              >
-                A background creation job is created for the selected records.
-              </div>
-            </div>
-
-            <div>
-              <strong>2. Shopify pages are created</strong>
-              <div
-                style={{
-                  marginTop: "4px",
-                  color: "#616161",
-                  fontSize: "13px",
-                  lineHeight: "1.5",
-                }}
-              >
-                Page titles, handles, template assignment and YMMT metafields
-                are written to Shopify.
-              </div>
-            </div>
-
-            <div>
-              <strong>3. Progress is tracked</strong>
-              <div
-                style={{
-                  marginTop: "4px",
-                  color: "#616161",
-                  fontSize: "13px",
-                  lineHeight: "1.5",
-                }}
-              >
-                Created, skipped and failed pages are tracked with detailed
-                logs.
-              </div>
-            </div>
-          </div>
-        </s-section>
-
-        {/* Bottom actions */}
         <div
           style={{
             display: "flex",
             justifyContent: "space-between",
             alignItems: "center",
             gap: "12px",
-            flexWrap: "wrap",
           }}
         >
-          <Link
-            to={`/app/review?uploadId=${encodeURIComponent(upload.id)}`}
-            style={{
-              color: "#616161",
-              textDecoration: "none",
-              fontWeight: "600",
-            }}
-          >
+          <Link to={`/app/review?uploadId=${encodeURIComponent(upload.id)}`}>
             ← Back to Review
           </Link>
 
@@ -435,22 +348,19 @@ export default function CreatePages() {
 
             <button
               type="submit"
-              disabled={isCreating || selectedCount === 0}
+              disabled={isCreating || selectedCount === 0 || pageCount === 0}
               style={{
-                padding: "12px 20px",
+                padding: "9px 14px",
                 borderRadius: "8px",
-                border: "none",
-                background:
-                  isCreating || selectedCount === 0 ? "#b5b5b5" : "#303030",
-                color: "#ffffff",
+                border: "1px solid #c9c9c9",
+                background: "#ffffff",
                 fontWeight: "650",
-                cursor:
-                  isCreating || selectedCount === 0 ? "not-allowed" : "pointer",
+                cursor: "pointer",
               }}
             >
               {isCreating
                 ? "Starting Creation Job..."
-                : `Create ${selectedCount} Pages`}
+                : `Create ${pageCount} Page${pageCount === 1 ? "" : "s"}`}
             </button>
           </Form>
         </div>

@@ -1,5 +1,9 @@
 import { buildYMMTPageContent } from "./ymmt-page-content.server";
 
+/* =========================================================
+   UPDATE PAGE CONTENT
+========================================================= */
+
 export async function updateYMMTPageContent(admin, pageId) {
   const response = await admin.graphql(
     `#graphql
@@ -51,30 +55,31 @@ export async function updateYMMTPageContent(admin, pageId) {
 
   const updateResponse = await admin.graphql(
     `#graphql
-      mutation UpdateYMMTPageContent(
-        $id: ID!
-        $page: PageUpdateInput!
-      ) {
-        pageUpdate(
-          id: $id
-          page: $page
+        mutation UpdateYMMTPageContent(
+          $id: ID!
+          $page: PageUpdateInput!
         ) {
-          page {
-            id
-            title
-            handle
-          }
+          pageUpdate(
+            id: $id
+            page: $page
+          ) {
+            page {
+              id
+              title
+              handle
+            }
 
-          userErrors {
-            field
-            message
+            userErrors {
+              field
+              message
+            }
           }
         }
-      }
-    `,
+      `,
     {
       variables: {
         id: pageId,
+
         page: {
           body: pageBody,
         },
@@ -97,45 +102,19 @@ export async function updateYMMTPageContent(admin, pageId) {
   return result?.page;
 }
 
+/* =========================================================
+   MANUAL SEARCH
+========================================================= */
+
 export async function searchYMMTPages(admin, filters = {}) {
   const pages = [];
+
   let requestCount = 0;
   const MAX_REQUESTS = 20;
+
   let cursor = null;
   let hasNextPage = true;
 
-  // const normalized = {
-  //   search: String(filters.search || "")
-  //     .trim()
-  //     .toLowerCase(),
-  //   year: String(filters.year || "")
-  //     .trim()
-  //     .toLowerCase(),
-  //   make: String(filters.make || "")
-  //     .trim()
-  //     .toLowerCase(),
-  //   model: String(filters.model || "")
-  //     .trim()
-  //     .toLowerCase(),
-  //   trim: String(filters.trim || "")
-  //     .trim()
-  //     .toLowerCase(),
-  //   manufacturer: String(filters.manufacturer || "")
-  //     .trim()
-  //     .toLowerCase(),
-  //   compatibility: String(filters.compatibility || "")
-  //     .trim()
-  //     .toLowerCase(),
-  //   warning: String(filters.warning || "")
-  //     .trim()
-  //     .toLowerCase(),
-  //   productHandle: String(filters.productHandle || "")
-  //     .trim()
-  //     .toLowerCase(),
-  //   status: String(filters.status || "")
-  //     .trim()
-  //     .toLowerCase(),
-  // };
   const shopifyQueryParts = [];
 
   if (filters.search) {
@@ -151,16 +130,25 @@ export async function searchYMMTPages(admin, filters = {}) {
   }
 
   const shopifyQuery = shopifyQueryParts.join(" AND ");
+
   while (hasNextPage) {
     if (requestCount >= MAX_REQUESTS) {
       break;
     }
 
-    requestCount++;
+    requestCount += 1;
+
     const response = await admin.graphql(
       `#graphql
-          query ManagePages($after: String, $query: String) {
-            pages(first: 100, after: $after, query: $query) {
+          query ManagePages(
+            $after: String
+            $query: String
+          ) {
+            pages(
+              first: 100
+              after: $after
+              query: $query
+            ) {
               nodes {
                 id
                 title
@@ -200,6 +188,7 @@ export async function searchYMMTPages(admin, filters = {}) {
       {
         variables: {
           after: cursor,
+
           query: shopifyQuery || null,
         },
       },
@@ -218,10 +207,6 @@ export async function searchYMMTPages(admin, filters = {}) {
     }
 
     for (const page of connection.nodes) {
-      /*
-       * We treat product-ymmt pages as managed YMMT pages.
-       * Search can match either handle or title.
-       */
       const isYMMT = page.templateSuffix === "product-ymmt";
 
       if (!isYMMT) {
@@ -238,18 +223,27 @@ export async function searchYMMTPages(admin, filters = {}) {
 
       const pageData = {
         id: page.id,
+
         title: page.title,
+
         handle: page.handle,
+
         templateSuffix: page.templateSuffix,
+
         isPublished: page.isPublished,
 
         productHandle: page.productHandle?.value || "",
+
         sourceProductHandle: page.sourceProductHandle?.value || "",
 
         year: String(vehicle.year || ""),
+
         make: String(vehicle.make || ""),
+
         model: String(vehicle.model || ""),
+
         trim: String(vehicle.trim || ""),
+
         manufacturer: String(vehicle.manufacturer || ""),
 
         compatibility: String(vehicle.compatible || vehicle.compat || ""),
@@ -295,20 +289,28 @@ export async function searchYMMTPages(admin, filters = {}) {
   return pages;
 }
 
+/* =========================================================
+   DELETE PAGE
+========================================================= */
+
 export async function deleteShopifyPage(admin, pageId) {
   const response = await admin.graphql(
     `#graphql
-      mutation DeletePage($id: ID!) {
-        pageDelete(id: $id) {
-          deletedPageId
+        mutation DeletePage(
+          $id: ID!
+        ) {
+          pageDelete(
+            id: $id
+          ) {
+            deletedPageId
 
-          userErrors {
-            field
-            message
+            userErrors {
+              field
+              message
+            }
           }
         }
-      }
-    `,
+      `,
     {
       variables: {
         id: pageId,
@@ -331,6 +333,10 @@ export async function deleteShopifyPage(admin, pageId) {
   return result?.deletedPageId;
 }
 
+/* =========================================================
+   UPDATE PRODUCT HANDLE
+========================================================= */
+
 export async function updateYMMTProductHandle(
   admin,
   { pageId, productHandle },
@@ -340,15 +346,21 @@ export async function updateYMMTProductHandle(
   if (productHandle) {
     metafields.push({
       namespace: "ymmt",
+
       key: "product_handle",
+
       type: "single_line_text_field",
+
       value: productHandle,
     });
 
     metafields.push({
       namespace: "ymmt",
+
       key: "source_product_handle",
+
       type: "single_line_text_field",
+
       value: productHandle,
     });
   }
@@ -363,28 +375,28 @@ export async function updateYMMTProductHandle(
 
   const response = await admin.graphql(
     `#graphql
-      mutation UpdatePage(
-        $id: ID!
-        $page: PageUpdateInput!
-      ) {
-        pageUpdate(
-          id: $id
-          page: $page
+        mutation UpdatePage(
+          $id: ID!
+          $page: PageUpdateInput!
         ) {
-          page {
-            id
-            title
-            handle
-            templateSuffix
-          }
+          pageUpdate(
+            id: $id
+            page: $page
+          ) {
+            page {
+              id
+              title
+              handle
+              templateSuffix
+            }
 
-          userErrors {
-            field
-            message
+            userErrors {
+              field
+              message
+            }
           }
         }
-      }
-    `,
+      `,
     {
       variables: {
         id: pageId,
@@ -408,31 +420,40 @@ export async function updateYMMTProductHandle(
   return result?.page;
 }
 
+/* =========================================================
+   SNAPSHOT
+========================================================= */
+
 export async function getShopifyPageSnapshot(admin, pageId) {
   const response = await admin.graphql(
     `#graphql
-      query GetPageSnapshot($id: ID!) {
-        page(id: $id) {
-          id
-          title
-          handle
-          body
-          templateSuffix
-          isPublished
-          publishedAt
+        query GetPageSnapshot(
+          $id: ID!
+        ) {
+          page(id: $id) {
+            id
+            title
+            handle
+            body
+            templateSuffix
+            isPublished
+            publishedAt
 
-          metafields(first: 50, namespace: "ymmt") {
-            nodes {
-              id
-              namespace
-              key
-              type
-              value
+            metafields(
+              first: 50
+              namespace: "ymmt"
+            ) {
+              nodes {
+                id
+                namespace
+                key
+                type
+                value
+              }
             }
           }
         }
-      }
-    `,
+      `,
     {
       variables: {
         id: pageId,
@@ -453,20 +474,31 @@ export async function getShopifyPageSnapshot(admin, pageId) {
   return json.data.page;
 }
 
+/* =========================================================
+   RESTORE SNAPSHOT
+========================================================= */
+
 export async function restoreShopifyPageSnapshot(admin, snapshot) {
   const metafields =
     snapshot.metafields?.nodes?.map((metafield) => ({
       namespace: metafield.namespace,
+
       key: metafield.key,
+
       type: metafield.type,
+
       value: metafield.value,
     })) || [];
 
   const page = {
     title: snapshot.title,
+
     handle: snapshot.handle,
+
     body: snapshot.body || "",
+
     templateSuffix: snapshot.templateSuffix || "",
+
     isPublished: Boolean(snapshot.isPublished),
   };
 
@@ -476,32 +508,33 @@ export async function restoreShopifyPageSnapshot(admin, snapshot) {
 
   const response = await admin.graphql(
     `#graphql
-      mutation RestorePage(
-        $id: ID!
-        $page: PageUpdateInput!
-      ) {
-        pageUpdate(
-          id: $id
-          page: $page
+        mutation RestorePage(
+          $id: ID!
+          $page: PageUpdateInput!
         ) {
-          page {
-            id
-            title
-            handle
-            templateSuffix
-            isPublished
-          }
+          pageUpdate(
+            id: $id
+            page: $page
+          ) {
+            page {
+              id
+              title
+              handle
+              templateSuffix
+              isPublished
+            }
 
-          userErrors {
-            field
-            message
+            userErrors {
+              field
+              message
+            }
           }
         }
-      }
-    `,
+      `,
     {
       variables: {
         id: snapshot.id,
+
         page,
       },
     },
@@ -522,6 +555,10 @@ export async function restoreShopifyPageSnapshot(admin, snapshot) {
   return result?.page;
 }
 
+/* =========================================================
+   VEHICLE HELPERS
+========================================================= */
+
 function normalizeVehicleValue(value) {
   return String(value || "")
     .trim()
@@ -534,7 +571,94 @@ function getVehicleKey(record) {
     .join("|");
 }
 
-export async function searchYMMTPagesByRecords(admin, records) {
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/* =========================================================
+   GRAPHQL THROTTLE RETRY
+========================================================= */
+
+async function graphqlWithThrottleRetry(
+  admin,
+  query,
+  options,
+  { maxRetries = 6, initialDelay = 1000, onThrottle = null } = {},
+) {
+  let attempt = 0;
+
+  while (true) {
+    const response = await admin.graphql(query, options);
+
+    const json = await response.json();
+
+    const throttledError = json.errors?.find(
+      (error) =>
+        error.extensions?.code === "THROTTLED" ||
+        String(error.message || "")
+          .toLowerCase()
+          .includes("throttled"),
+    );
+
+    if (!throttledError) {
+      return json;
+    }
+
+    if (attempt >= maxRetries) {
+      throw new Error(
+        `Shopify API remained throttled after ${
+          maxRetries + 1
+        } attempts. Please wait a moment and search again.`,
+      );
+    }
+
+    const throttleStatus =
+      json.extensions?.cost?.throttleStatus ||
+      throttledError.extensions?.cost?.throttleStatus;
+
+    let delay = initialDelay * Math.pow(2, attempt);
+
+    delay = Math.min(delay, 10000);
+
+    if (
+      throttleStatus &&
+      Number(throttleStatus.currentlyAvailable || 0) < 100
+    ) {
+      delay = Math.max(delay, 2500);
+    }
+
+    console.warn(
+      `[YMMT Search] Shopify throttled request. Retry ${
+        attempt + 1
+      }/${maxRetries} in ${delay}ms.`,
+    );
+
+    if (typeof onThrottle === "function") {
+      await onThrottle({
+        attempt: attempt + 1,
+
+        delay,
+
+        throttleStatus,
+      });
+    }
+
+    await sleep(delay);
+
+    attempt += 1;
+  }
+}
+
+/* =========================================================
+   JSON SEARCH WITH LIVE PROGRESS
+========================================================= */
+
+export async function searchYMMTPagesByRecords(admin, records, options = {}) {
+  const onProgress =
+    typeof options.onProgress === "function"
+      ? options.onProgress
+      : async () => {};
+
   if (!records?.length) {
     return {
       pages: [],
@@ -542,86 +666,229 @@ export async function searchYMMTPagesByRecords(admin, records) {
     };
   }
 
+  /*
+   * All JSON vehicles by unique
+   * Year|Make|Model|Trim key.
+   */
   const wantedVehicles = new Map();
 
   for (const record of records) {
     wantedVehicles.set(getVehicleKey(record), record);
   }
 
-  const matchedKeys = new Set();
-  const pages = [];
+  /*
+   * Group requested vehicles
+   * by year.
+   */
+  const wantedKeysByYear = new Map();
+
+  for (const record of records) {
+    const year = String(record.year || "").trim();
+
+    if (!year) {
+      continue;
+    }
+
+    if (!wantedKeysByYear.has(year)) {
+      wantedKeysByYear.set(year, new Set());
+    }
+
+    wantedKeysByYear.get(year).add(getVehicleKey(record));
+  }
 
   /*
-   * Search one year at a time instead of scanning the
-   * entire Shopify page library for every JSON record.
+   * IMPORTANT:
+   * calculate AFTER filling
+   * wantedKeysByYear.
    */
-  const years = [
-    ...new Set(
-      records.map((record) => String(record.year || "").trim()).filter(Boolean),
-    ),
-  ];
+  const totalYears = wantedKeysByYear.size;
 
-  for (const year of years) {
+  let processedYears = 0;
+
+  let totalRequestCount = 0;
+
+  const matchedKeys = new Set();
+
+  const pages = [];
+
+  const seenPageIds = new Set();
+
+  /*
+   * Search one year at a time.
+   *
+   * We DO NOT stop after seeing
+   * every vehicle once because one
+   * vehicle can have multiple
+   * product-specific pages.
+   */
+  for (const [year, wantedYearKeys] of wantedKeysByYear.entries()) {
     let cursor = null;
+
     let hasNextPage = true;
 
+    let requestCount = 0;
+
+    const foundYearKeys = new Set();
+
+    /*
+     * 60 × 100 = maximum
+     * 6,000 candidate pages
+     * inspected per year.
+     */
+    const MAX_REQUESTS_PER_YEAR = 60;
+
+    console.log(
+      `[YMMT JSON Search] Starting year ${year}. ${wantedYearKeys.size} vehicle(s) requested.`,
+    );
+
+    await onProgress({
+      currentYear: year,
+
+      processedYears,
+
+      requestCount: totalRequestCount,
+
+      currentYearTotal: wantedYearKeys.size,
+
+      currentYearFound: 0,
+
+      currentYearMissing: wantedYearKeys.size,
+
+      pagesFound: pages.length,
+
+      missingCount: records.length - matchedKeys.size,
+
+      progress:
+        totalYears > 0 ? Math.floor((processedYears / totalYears) * 100) : 0,
+
+      message: `Searching ${year}...`,
+    });
+
     while (hasNextPage) {
-      const response = await admin.graphql(
+      if (requestCount >= MAX_REQUESTS_PER_YEAR) {
+        await onProgress({
+          currentYear: year,
+
+          processedYears,
+
+          requestCount: totalRequestCount,
+
+          currentYearTotal: wantedYearKeys.size,
+
+          currentYearFound: foundYearKeys.size,
+
+          currentYearMissing: Math.max(
+            0,
+
+            wantedYearKeys.size - foundYearKeys.size,
+          ),
+
+          pagesFound: pages.length,
+
+          missingCount: records.length - matchedKeys.size,
+
+          message: `Safety limit reached for ${year}. Finishing with the pages found so far.`,
+        });
+
+        break;
+      }
+
+      requestCount += 1;
+
+      totalRequestCount += 1;
+
+      const json = await graphqlWithThrottleRetry(
+        admin,
+
         `#graphql
-          query SearchYMMTPagesFromJson(
-            $after: String
-            $query: String
-          ) {
-            pages(
-              first: 100
-              after: $after
-              query: $query
+            query SearchYMMTPagesFromJson(
+              $after: String
+              $query: String
             ) {
-              nodes {
-                id
-                title
-                handle
-                templateSuffix
-                isPublished
+              pages(
+                first: 100
+                after: $after
+                query: $query
+              ) {
+                nodes {
+                  id
+                  title
+                  handle
+                  templateSuffix
+                  isPublished
 
-                vehicle: metafield(
-                  namespace: "ymmt"
-                  key: "vehicle"
-                ) {
-                  value
+                  vehicle: metafield(
+                    namespace: "ymmt"
+                    key: "vehicle"
+                  ) {
+                    value
+                  }
+
+                  productHandle: metafield(
+                    namespace: "ymmt"
+                    key: "product_handle"
+                  ) {
+                    value
+                  }
+
+                  sourceProductHandle: metafield(
+                    namespace: "ymmt"
+                    key: "source_product_handle"
+                  ) {
+                    value
+                  }
                 }
 
-                productHandle: metafield(
-                  namespace: "ymmt"
-                  key: "product_handle"
-                ) {
-                  value
+                pageInfo {
+                  hasNextPage
+                  endCursor
                 }
-
-                sourceProductHandle: metafield(
-                  namespace: "ymmt"
-                  key: "source_product_handle"
-                ) {
-                  value
-                }
-              }
-
-              pageInfo {
-                hasNextPage
-                endCursor
               }
             }
-          }
-        `,
+          `,
+
         {
           variables: {
             after: cursor,
+
             query: year,
           },
         },
-      );
 
-      const json = await response.json();
+        {
+          maxRetries: 6,
+
+          initialDelay: 1000,
+
+          onThrottle: async ({ attempt, delay }) => {
+            await onProgress({
+              currentYear: year,
+
+              processedYears,
+
+              requestCount: totalRequestCount,
+
+              currentYearTotal: wantedYearKeys.size,
+
+              currentYearFound: foundYearKeys.size,
+
+              currentYearMissing: Math.max(
+                0,
+
+                wantedYearKeys.size - foundYearKeys.size,
+              ),
+
+              pagesFound: pages.length,
+
+              missingCount: records.length - matchedKeys.size,
+
+              message: `Shopify throttled the request. Retrying in ${Math.round(
+                delay / 1000,
+              )}s (attempt ${attempt})...`,
+            });
+          },
+        },
+      );
 
       if (json.errors?.length) {
         throw new Error(json.errors.map((error) => error.message).join(", "));
@@ -652,7 +919,7 @@ export async function searchYMMTPagesByRecords(admin, records) {
 
         const key = getVehicleKey(vehicle);
 
-        if (!wantedVehicles.has(key)) {
+        if (!wantedYearKeys.has(key)) {
           continue;
         }
 
@@ -660,41 +927,184 @@ export async function searchYMMTPagesByRecords(admin, records) {
 
         matchedKeys.add(key);
 
+        foundYearKeys.add(key);
+
+        /*
+         * Same Shopify page should
+         * never be added twice.
+         */
+        if (seenPageIds.has(page.id)) {
+          continue;
+        }
+
+        seenPageIds.add(page.id);
+
         pages.push({
           id: page.id,
+
           title: page.title,
+
           handle: page.handle,
+
           templateSuffix: page.templateSuffix,
+
           isPublished: page.isPublished,
 
           productHandle: page.productHandle?.value || "",
+
           sourceProductHandle: page.sourceProductHandle?.value || "",
 
           year: vehicle.year || "",
+
           make: vehicle.make || "",
+
           model: vehicle.model || "",
+
           trim: vehicle.trim || "",
 
           manufacturer:
-            vehicle.manufacturer || originalRecord.manufacturer || "",
+            vehicle.manufacturer || originalRecord?.manufacturer || "",
 
           compatibility:
             vehicle.compatible ||
             vehicle.compat ||
-            originalRecord.compatible ||
+            originalRecord?.compatible ||
             "",
 
-          warning: vehicle.warning || originalRecord.warning || "",
+          warning: vehicle.warning || originalRecord?.warning || "",
         });
       }
 
-      hasNextPage = connection.pageInfo.hasNextPage;
+      hasNextPage = Boolean(connection.pageInfo.hasNextPage);
+
       cursor = connection.pageInfo.endCursor;
+
+      /*
+       * Estimated progress within
+       * the current year.
+       *
+       * Exact percentage cannot be
+       * known because Shopify does not
+       * tell us total pages up-front.
+       */
+      const estimatedYearFraction = Math.min(
+        requestCount / MAX_REQUESTS_PER_YEAR,
+
+        0.95,
+      );
+
+      const estimatedProgress =
+        totalYears > 0
+          ? Math.min(
+              99,
+
+              Math.floor(
+                ((processedYears + estimatedYearFraction) / totalYears) * 100,
+              ),
+            )
+          : 0;
+
+      await onProgress({
+        currentYear: year,
+
+        processedYears,
+
+        requestCount: totalRequestCount,
+
+        currentYearTotal: wantedYearKeys.size,
+
+        currentYearFound: foundYearKeys.size,
+
+        currentYearMissing: Math.max(
+          0,
+
+          wantedYearKeys.size - foundYearKeys.size,
+        ),
+
+        pagesFound: pages.length,
+
+        missingCount: records.length - matchedKeys.size,
+
+        progress: estimatedProgress,
+
+        message:
+          `${year}: found ${foundYearKeys.size}/${wantedYearKeys.size} vehicle(s), ` +
+          `${pages.length} Shopify page(s) matched so far.`,
+      });
+
+      /*
+       * Small pause protects the
+       * production store API budget.
+       */
+      if (hasNextPage) {
+        await sleep(250);
+      }
     }
+
+    processedYears += 1;
+
+    await onProgress({
+      currentYear: year,
+
+      processedYears,
+
+      requestCount: totalRequestCount,
+
+      currentYearTotal: wantedYearKeys.size,
+
+      currentYearFound: foundYearKeys.size,
+
+      currentYearMissing: Math.max(
+        0,
+
+        wantedYearKeys.size - foundYearKeys.size,
+      ),
+
+      pagesFound: pages.length,
+
+      missingCount: records.length - matchedKeys.size,
+
+      progress:
+        totalYears > 0
+          ? Math.min(
+              99,
+
+              Math.floor((processedYears / totalYears) * 100),
+            )
+          : 99,
+
+      message: `Finished ${year}.`,
+    });
   }
 
   const missingRecords = records.filter(
     (record) => !matchedKeys.has(getVehicleKey(record)),
+  );
+
+  await onProgress({
+    currentYear: null,
+
+    processedYears,
+
+    requestCount: totalRequestCount,
+
+    currentYearTotal: 0,
+
+    currentYearFound: 0,
+
+    currentYearMissing: 0,
+
+    pagesFound: pages.length,
+
+    missingCount: missingRecords.length,
+
+    progress: 100,
+
+    message: "Search completed.",
+  });
+
+  console.log(
+    `[YMMT JSON Search] Complete. ${pages.length} Shopify page(s) found, ${missingRecords.length} vehicle record(s) missing.`,
   );
 
   return {
@@ -702,6 +1112,10 @@ export async function searchYMMTPagesByRecords(admin, records) {
     missingRecords,
   };
 }
+
+/* =========================================================
+   RECREATE DELETED PAGE
+========================================================= */
 
 export async function recreateShopifyPageFromSnapshot(admin, snapshot) {
   if (!snapshot) {
@@ -711,16 +1125,23 @@ export async function recreateShopifyPageFromSnapshot(admin, snapshot) {
   const metafields =
     snapshot.metafields?.nodes?.map((metafield) => ({
       namespace: metafield.namespace,
+
       key: metafield.key,
+
       type: metafield.type,
+
       value: metafield.value,
     })) || [];
 
   const page = {
     title: snapshot.title,
+
     handle: snapshot.handle,
+
     body: snapshot.body || "",
+
     templateSuffix: snapshot.templateSuffix || "",
+
     isPublished: Boolean(snapshot.isPublished),
   };
 
@@ -730,23 +1151,27 @@ export async function recreateShopifyPageFromSnapshot(admin, snapshot) {
 
   const response = await admin.graphql(
     `#graphql
-      mutation RecreateDeletedPage($page: PageCreateInput!) {
-        pageCreate(page: $page) {
-          page {
-            id
-            title
-            handle
-            templateSuffix
-            isPublished
-          }
+        mutation RecreateDeletedPage(
+          $page: PageCreateInput!
+        ) {
+          pageCreate(
+            page: $page
+          ) {
+            page {
+              id
+              title
+              handle
+              templateSuffix
+              isPublished
+            }
 
-          userErrors {
-            field
-            message
+            userErrors {
+              field
+              message
+            }
           }
         }
-      }
-    `,
+      `,
     {
       variables: {
         page,

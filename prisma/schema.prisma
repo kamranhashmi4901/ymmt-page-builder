@@ -176,3 +176,46 @@ model PageChangeLog {
   @@index([shopifyPageId])
   @@index([handle])
 }
+
+model YmmtPageSearchJob {
+  id String @id @default(cuid())
+
+  shop   String
+  status String @default("pending")
+
+  fileName String?
+
+  totalRecords Int @default(0)
+  totalYears   Int @default(0)
+
+  processedYears Int @default(0)
+
+  currentYear String?
+
+  requestCount Int @default(0)
+
+  currentYearTotal   Int @default(0)
+  currentYearFound   Int @default(0)
+  currentYearMissing Int @default(0)
+
+  pagesFound   Int @default(0)
+  missingCount Int @default(0)
+
+  progress Int @default(0)
+
+  message String?
+  error   String?
+
+  recordsJson String
+
+  resultPagesJson    String?
+  missingRecordsJson String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  startedAt  DateTime?
+  finishedAt DateTime?
+
+  @@index([shop, createdAt])
+}

@@ -452,3 +452,253 @@ export async function getShopifyPageSnapshot(admin, pageId) {
 
   return json.data.page;
 }
+
+export async function restoreShopifyPageSnapshot(admin, snapshot) {
+  const metafields =
+    snapshot.metafields?.nodes?.map((metafield) => ({
+      namespace: metafield.namespace,
+      key: metafield.key,
+      type: metafield.type,
+      value: metafield.value,
+    })) || [];
+
+  const page = {
+    title: snapshot.title,
+    handle: snapshot.handle,
+    body: snapshot.body || "",
+    templateSuffix: snapshot.templateSuffix || "",
+    isPublished: Boolean(snapshot.isPublished),
+  };
+
+  if (metafields.length > 0) {
+    page.metafields = metafields;
+  }
+
+  const response = await admin.graphql(
+    `#graphql
+      mutation RestorePage(
+        $id: ID!
+        $page: PageUpdateInput!
+      ) {
+        pageUpdate(
+          id: $id
+          page: $page
+        ) {
+          page {
+            id
+            title
+            handle
+            templateSuffix
+            isPublished
+          }
+
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `,
+    {
+      variables: {
+        id: snapshot.id,
+        page,
+      },
+    },
+  );
+
+  const json = await response.json();
+
+  if (json.errors?.length) {
+    throw new Error(json.errors.map((error) => error.message).join(", "));
+  }
+
+  const result = json.data?.pageUpdate;
+
+  if (result?.userErrors?.length) {
+    throw new Error(result.userErrors.map((error) => error.message).join(", "));
+  }
+
+  return result?.page;
+}
+
+function normalizeVehicleValue(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase();
+}
+
+function getVehicleKey(record) {
+  return [record.year, record.make, record.model, record.trim || ""]
+    .map(normalizeVehicleValue)
+    .join("|");
+}
+
+export async function searchYMMTPagesByRecords(admin, records) {
+  if (!records?.length) {
+    return {
+      pages: [],
+      missingRecords: [],
+    };
+  }
+
+  const wantedVehicles = new Map();
+
+  for (const record of records) {
+    wantedVehicles.set(getVehicleKey(record), record);
+  }
+
+  const matchedKeys = new Set();
+  const pages = [];
+
+  /*
+   * Search one year at a time instead of scanning the
+   * entire Shopify page library for every JSON record.
+   */
+  const years = [
+    ...new Set(
+      records.map((record) => String(record.year || "").trim()).filter(Boolean),
+    ),
+  ];
+
+  for (const year of years) {
+    let cursor = null;
+    let hasNextPage = true;
+
+    while (hasNextPage) {
+      const response = await admin.graphql(
+        `#graphql
+          query SearchYMMTPagesFromJson(
+            $after: String
+            $query: String
+          ) {
+            pages(
+              first: 100
+              after: $after
+              query: $query
+            ) {
+              nodes {
+                id
+                title
+                handle
+                templateSuffix
+                isPublished
+
+                vehicle: metafield(
+                  namespace: "ymmt"
+                  key: "vehicle"
+                ) {
+                  value
+                }
+
+                productHandle: metafield(
+                  namespace: "ymmt"
+                  key: "product_handle"
+                ) {
+                  value
+                }
+
+                sourceProductHandle: metafield(
+                  namespace: "ymmt"
+                  key: "source_product_handle"
+                ) {
+                  value
+                }
+              }
+
+              pageInfo {
+                hasNextPage
+                endCursor
+              }
+            }
+          }
+        `,
+        {
+          variables: {
+            after: cursor,
+            query: year,
+          },
+        },
+      );
+
+      const json = await response.json();
+
+      if (json.errors?.length) {
+        throw new Error(json.errors.map((error) => error.message).join(", "));
+      }
+
+      const connection = json.data?.pages;
+
+      if (!connection) {
+        break;
+      }
+
+      for (const page of connection.nodes) {
+        if (page.templateSuffix !== "product-ymmt") {
+          continue;
+        }
+
+        if (!page.vehicle?.value) {
+          continue;
+        }
+
+        let vehicle;
+
+        try {
+          vehicle = JSON.parse(page.vehicle.value);
+        } catch {
+          continue;
+        }
+
+        const key = getVehicleKey(vehicle);
+
+        if (!wantedVehicles.has(key)) {
+          continue;
+        }
+
+        const originalRecord = wantedVehicles.get(key);
+
+        matchedKeys.add(key);
+
+        pages.push({
+          id: page.id,
+          title: page.title,
+          handle: page.handle,
+          templateSuffix: page.templateSuffix,
+          isPublished: page.isPublished,
+
+          productHandle: page.productHandle?.value || "",
+          sourceProductHandle: page.sourceProductHandle?.value || "",
+
+          year: vehicle.year || "",
+          make: vehicle.make || "",
+          model: vehicle.model || "",
+          trim: vehicle.trim || "",
+
+          manufacturer:
+            vehicle.manufacturer || originalRecord.manufacturer || "",
+
+          compatibility:
+            vehicle.compatible ||
+            vehicle.compat ||
+            originalRecord.compatible ||
+            "",
+
+          warning: vehicle.warning || originalRecord.warning || "",
+        });
+      }
+
+      hasNextPage = connection.pageInfo.hasNextPage;
+      cursor = connection.pageInfo.endCursor;
+    }
+  }
+
+  const missingRecords = records.filter(
+    (record) => !matchedKeys.has(getVehicleKey(record)),
+  );
+
+  return {
+    pages,
+    missingRecords,
+  };
+}

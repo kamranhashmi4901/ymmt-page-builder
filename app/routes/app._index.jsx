@@ -37,7 +37,7 @@ export default function Index() {
   ];
 
   return (
-    <s-page heading="YMMT Page Builder">
+    <s-page heading="YMMT Page Builder (dev)">
       <div
         style={{
           display: "flex",

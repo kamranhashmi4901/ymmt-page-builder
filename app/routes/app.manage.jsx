@@ -15,7 +15,11 @@ import {
   searchYMMTPages,
   updateYMMTProductHandle,
   updateYMMTPageContent,
+  restoreShopifyPageSnapshot,
+  searchYMMTPagesByRecords,
 } from "../lib/shopify-manage-pages.server";
+
+import { parseYMMT } from "../lib/ymmt-parser.server";
 
 import {
   createActionSession,
@@ -24,8 +28,17 @@ import {
   markPageChangeFailed,
   completeActionSession,
   getRecentActionSessions,
+  getActionSession,
+  markChangeRolledBack,
+  markSessionRolledBack,
 } from "../lib/page-change-log.server";
 
+// =============================================================================
+// LOADER
+// Loads manual-search results, recent change sessions and optional session detail.
+// It intentionally avoids fetching Shopify pages until at least one manual filter
+// is provided, which keeps the default Manage Pages load lightweight.
+// =============================================================================
 export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
 
@@ -52,14 +65,29 @@ export const loader = async ({ request }) => {
 
   const recentSessions = await getRecentActionSessions(session.shop, 10);
 
+  const sessionId = url.searchParams.get("sessionId") || "";
+
+  let selectedSession = null;
+
+  if (sessionId) {
+    selectedSession = await getActionSession(session.shop, sessionId);
+  }
+
   return {
     pages,
     filters,
     recentSessions,
     hasFilters,
+    selectedSession,
   };
 };
 
+// =============================================================================
+// ACTION
+// Handles every POST operation from this route. Rollback and JSON search are
+// handled before pageIds validation because neither operation starts from the
+// Step 2 selected-page form.
+// =============================================================================
 export const action = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
 
@@ -67,6 +95,160 @@ export const action = async ({ request }) => {
   const formData = await request.formData();
 
   const intent = String(formData.get("intent") || "");
+
+  // --------------------------------------------------
+  // Rollback a previous action session
+  // --------------------------------------------------
+
+  if (intent === "rollback-session") {
+    const sessionId = String(formData.get("sessionId") || "");
+
+    if (!sessionId) {
+      return {
+        success: false,
+        error: "Missing session ID.",
+      };
+    }
+
+    const actionSession = await getActionSession(shop, sessionId);
+
+    if (!actionSession) {
+      return {
+        success: false,
+        error: "Session not found.",
+      };
+    }
+
+    if (actionSession.rolledBackAt) {
+      return {
+        success: false,
+        error: "This session has already been rolled back.",
+      };
+    }
+
+    const rollbackResults = [];
+
+    for (const change of actionSession.changes) {
+      if (change.status !== "success" || change.rolledBackAt) {
+        continue;
+      }
+
+      try {
+        const snapshot = JSON.parse(change.beforeData);
+
+        if (change.action === "delete") {
+          rollbackResults.push({
+            changeId: change.id,
+            status: "skipped",
+            message:
+              "Delete rollback requires page recreation and will be added separately.",
+          });
+
+          continue;
+        }
+
+        await restoreShopifyPageSnapshot(admin, snapshot);
+
+        await markChangeRolledBack(change.id);
+
+        rollbackResults.push({
+          changeId: change.id,
+          status: "restored",
+          handle: change.handle,
+        });
+      } catch (error) {
+        rollbackResults.push({
+          changeId: change.id,
+          status: "failed",
+          handle: change.handle,
+          message: error.message,
+        });
+      }
+    }
+
+    // A session is only considered fully rolled back when every eligible change
+    // was actually restored. Delete changes are currently skipped because they
+    // require recreating the deleted Shopify page with a new page ID.
+    const restored = rollbackResults.filter(
+      (result) => result.status === "restored",
+    ).length;
+    const failures = rollbackResults.filter(
+      (result) => result.status === "failed",
+    ).length;
+    const skipped = rollbackResults.filter(
+      (result) => result.status === "skipped",
+    ).length;
+
+    if (restored > 0 && failures === 0 && skipped === 0) {
+      await markSessionRolledBack(sessionId);
+    }
+
+    return {
+      success: true,
+      intent,
+      rollbackResults,
+      restored,
+      failed: failures,
+      skipped,
+    };
+  }
+  // ---------------------------------------------------------------------------
+  // SEARCH BY JSON
+  // Reuses parseYMMT(), the same normalization used by page creation. The
+  // resulting records are matched to existing managed Shopify pages.
+  // ---------------------------------------------------------------------------
+  if (intent === "json-search") {
+    const file = formData.get("ymmtFile");
+
+    if (!file || typeof file.text !== "function") {
+      return {
+        success: false,
+        intent,
+        error: "Please select a YMMT JSON file.",
+      };
+    }
+
+    if (
+      file.type &&
+      file.type !== "application/json" &&
+      !file.name?.toLowerCase().endsWith(".json")
+    ) {
+      return {
+        success: false,
+        intent,
+        error: "Only JSON files are supported.",
+      };
+    }
+
+    try {
+      const text = await file.text();
+      const raw = JSON.parse(text);
+
+      const parsed = parseYMMT(raw);
+
+      const result = await searchYMMTPagesByRecords(admin, parsed.entries);
+
+      return {
+        success: true,
+        intent,
+        fileName: file.name,
+
+        totalRecords: parsed.entries.length,
+        matched: result.pages.length,
+        missing: result.missingRecords.length,
+
+        pages: result.pages,
+        missingRecords: result.missingRecords,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        intent,
+        error: error.message || "Unable to search pages from this JSON file.",
+      };
+    }
+  }
+
   const pageIds = formData.getAll("pageIds").map(String);
 
   if (!pageIds.length) {
@@ -339,32 +521,82 @@ const tableHeaderStyle = {
 const tableCellStyle = {
   padding: "12px",
   borderBottom: "1px solid #eeeeee",
-  verticalAlign: "top",
+  // verticalAlign: "top",
   fontSize: "13px",
 };
 
 export default function ManagePages() {
+  // ---------------------------------------------------------------------------
+  // CLIENT WORKFLOW STATE
+  // ---------------------------------------------------------------------------
+  // The management screen is a small wizard:
+  // select -> action -> review.
   const [step, setStep] = useState("select");
+
+  // Tracks the bulk operation the merchant wants to perform.
+  // Supported values: update-product | update-content | delete.
   const [selectedAction, setSelectedAction] = useState("");
-  const { pages, filters, recentSessions, hasFilters } = useLoaderData();
 
+  // The page can search with manual filters or by uploading the same YMMT JSON
+  // format used by the page-creation workflow.
+  const [searchMode, setSearchMode] = useState("manual");
+
+  // Data loaded by the GET loader (manual search + recent audit sessions).
+  const { pages, filters, recentSessions, hasFilters, selectedSession } =
+    useLoaderData();
+
+  // Data returned by POST actions (JSON search, updates, deletes and rollback).
   const actionData = useActionData();
-  const [selectedIds, setSelectedIds] = useState(new Set());
-
-  const [productHandle, setProductHandle] = useState("");
-  const [deleteConfirmation, setDeleteConfirmation] = useState("");
   const navigation = useNavigation();
 
+  // Pages returned by the JSON search action.
+  const jsonPages =
+    actionData?.intent === "json-search" && actionData?.success
+      ? actionData.pages || []
+      : [];
+
+  // Step 2 and the review screen always read from resultPages, so the rest of
+  // the UI does not need separate manual-search and JSON-search implementations.
+  const resultPages = searchMode === "json" ? jsonPages : pages;
+
+  // Selected Shopify page IDs are kept in a Set for quick checkbox lookups.
+  const [selectedIds, setSelectedIds] = useState(new Set());
+
+  // Form state used by the update/delete review screens.
+  const [productHandle, setProductHandle] = useState("");
+  const [deleteConfirmation, setDeleteConfirmation] = useState("");
+
+  // Friendly filename shown in the styled JSON upload box.
+  const [jsonFileName, setJsonFileName] = useState("");
+
+  // Manual GET searches navigate the route and therefore use the loading state.
   const isSearching =
     navigation.state === "loading" &&
     navigation.location?.pathname === "/app/manage";
 
-  const allSelected =
-    pages.length > 0 && pages.every((page) => selectedIds.has(page.id));
-
+  // POST actions use the submitting state. This also prevents duplicate clicks.
   const isSubmitting = navigation.state === "submitting";
-
   const submittingIntent = navigation.formData?.get("intent");
+
+  // JSON search is a POST because it uploads a file. Keep this separate from
+  // bulk page updates so the UI can show a specific loading message.
+  const isJsonSearching = isSubmitting && submittingIntent === "json-search";
+
+  // Manual results exist when URL filters are active. JSON results exist when a
+  // JSON-search action completed successfully. Either state can unlock Step 2.
+  const hasJsonResults =
+    searchMode === "json" &&
+    actionData?.intent === "json-search" &&
+    actionData?.success;
+
+  const canShowResults = searchMode === "manual" ? hasFilters : hasJsonResults;
+
+  // True when every currently visible result is selected.
+  const allSelected =
+    resultPages.length > 0 &&
+    resultPages.every((page) => selectedIds.has(page.id));
+
+  // Human-readable operation messages shown in the dark log panel.
   const actionLogs = [];
 
   if (isSubmitting) {
@@ -389,20 +621,54 @@ export default function ManagePages() {
         "[INFO] Backing up page data before deletion...",
       );
     }
+
+    if (submittingIntent === "rollback-session") {
+      actionLogs.push(
+        "[START] Rolling back selected session...",
+        "[INFO] Reading stored page snapshots...",
+        "[INFO] Restoring reversible page changes...",
+      );
+    }
   }
 
   if (actionData?.success) {
-    actionData.results?.forEach((result) => {
-      if (result.status === "updated" || result.status === "deleted") {
-        actionLogs.push(`[SUCCESS] ${result.handle || result.pageId}`);
-      } else {
-        actionLogs.push(
-          `[FAILED] ${result.handle || result.pageId} — ${
-            result.message || "Unknown error"
-          }`,
-        );
-      }
-    });
+    if (actionData.intent === "rollback-session") {
+      actionLogs.push(
+        `[INFO] Rollback completed. Restored: ${actionData.restored || 0}, Skipped: ${actionData.skipped || 0}, Failed: ${actionData.failed || 0}`,
+      );
+
+      actionData.rollbackResults?.forEach((result) => {
+        if (result.status === "restored") {
+          actionLogs.push(
+            `[SUCCESS] Restored ${result.handle || result.changeId}`,
+          );
+        } else if (result.status === "skipped") {
+          actionLogs.push(
+            `[SKIPPED] ${result.handle || result.changeId} — ${
+              result.message || "Not reversible"
+            }`,
+          );
+        } else {
+          actionLogs.push(
+            `[FAILED] ${result.handle || result.changeId} — ${
+              result.message || "Unknown rollback error"
+            }`,
+          );
+        }
+      });
+    } else {
+      actionData.results?.forEach((result) => {
+        if (result.status === "updated" || result.status === "deleted") {
+          actionLogs.push(`[SUCCESS] ${result.handle || result.pageId}`);
+        } else {
+          actionLogs.push(
+            `[FAILED] ${result.handle || result.pageId} — ${
+              result.message || "Unknown error"
+            }`,
+          );
+        }
+      });
+    }
   }
 
   const togglePage = (pageId) => {
@@ -423,9 +689,45 @@ export default function ManagePages() {
     if (allSelected) {
       setSelectedIds(new Set());
     } else {
-      setSelectedIds(new Set(pages.map((page) => page.id)));
+      setSelectedIds(new Set(resultPages.map((page) => page.id)));
     }
   };
+
+  // Reset wizard-specific client state when switching search sources so page
+  // IDs selected in one result set cannot accidentally carry into another.
+  const switchSearchMode = (mode) => {
+    setSearchMode(mode);
+    setSelectedIds(new Set());
+    setSelectedAction("");
+    setProductHandle("");
+    setDeleteConfirmation("");
+    setJsonFileName("");
+    setStep("select");
+  };
+
+  // Return to a clean search screen. A real navigation is used so manual URL
+  // filters and previous JSON action data are both cleared at the same time.
+  const startNewSearch = () => {
+    setSelectedIds(new Set());
+    setSelectedAction("");
+    setProductHandle("");
+    setDeleteConfirmation("");
+    setJsonFileName("");
+    setStep("select");
+    window.location.href = "/app/manage";
+  };
+
+  // JSON search has its own summary UI and should not create an empty operation
+  // log panel. The log panel is reserved for mutations and rollback actions.
+  const shouldShowOperationLogs =
+    (isSubmitting && submittingIntent !== "json-search") ||
+    (actionData?.success &&
+      [
+        "update-product",
+        "update-content",
+        "delete",
+        "rollback-session",
+      ].includes(actionData.intent));
 
   return (
     <s-page heading="Manage YMMT Pages">
@@ -445,410 +747,666 @@ export default function ManagePages() {
           gap: "18px",
         }}
       >
-        {/* Step 1 Search Pages  */}
-        <s-section>
-          <span
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: "7px",
-            }}
-          >
-            <s-icon type="search" />
-            <strong>Find YMMT Pages</strong>
-          </span>
-
-          <s-paragraph>
-            Search and filter existing YMMT pages before selecting pages to
-            manage.
-          </s-paragraph>
-
-          <Form method="get">
+        {/* Step 1 is hidden after a search finishes so the user can focus on
+            reviewing and selecting the matched pages. */}
+        {!canShowResults && (
+          <>
+            {/* Search mode switch. Both modes feed the same selection/action/review
+            wizard through resultPages. */}
             <div
               style={{
-                marginTop: "18px",
                 display: "flex",
-                flexDirection: "column",
-                gap: "14px",
+                gap: "8px",
               }}
             >
-              {/* General search */}
-              <input
-                type="text"
-                name="search"
-                defaultValue={filters.search}
-                placeholder="Search by page title or handle"
+              <button
+                type="button"
+                onClick={() => switchSearchMode("manual")}
                 style={{
-                  width: "100%",
-                  boxSizing: "border-box",
-                  padding: "10px 12px",
-                  border: "1px solid #c9c9c9",
+                  padding: "9px 14px",
                   borderRadius: "8px",
-                }}
-              />
-
-              {/* Vehicle filters */}
-              <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-                  gap: "12px",
+                  border:
+                    searchMode === "manual"
+                      ? "2px solid #303030"
+                      : "1px solid #c9c9c9",
+                  background: "#ffffff",
                 }}
               >
-                <input
-                  type="text"
-                  name="year"
-                  defaultValue={filters.year}
-                  placeholder="Year"
-                  style={filterInputStyle}
-                />
+                Manual Search
+              </button>
 
-                <input
-                  type="text"
-                  name="make"
-                  defaultValue={filters.make}
-                  placeholder="Make"
-                  style={filterInputStyle}
-                />
-
-                <input
-                  type="text"
-                  name="model"
-                  defaultValue={filters.model}
-                  placeholder="Model"
-                  style={filterInputStyle}
-                />
-
-                <input
-                  type="text"
-                  name="trim"
-                  defaultValue={filters.trim}
-                  placeholder="Trim"
-                  style={filterInputStyle}
-                />
-              </div>
-
-              {/* YMMT metadata filters */}
-              <div
+              <button
+                type="button"
+                onClick={() => switchSearchMode("json")}
                 style={{
-                  display: "grid",
-                  gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
-                  gap: "12px",
+                  padding: "9px 14px",
+                  borderRadius: "8px",
+                  border:
+                    searchMode === "json"
+                      ? "2px solid #303030"
+                      : "1px solid #c9c9c9",
+                  background: "#ffffff",
                 }}
               >
-                <input
-                  type="text"
-                  name="manufacturer"
-                  defaultValue={filters.manufacturer}
-                  placeholder="Manufacturer"
-                  style={filterInputStyle}
-                />
+                Search by JSON
+              </button>
+            </div>
+            {searchMode === "manual" && (
+              <>
+                {/* Step 1 Search Pages  */}
+                <s-section>
+                  <span
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "7px",
+                    }}
+                  >
+                    <s-icon type="search" />
+                    <strong>Find YMMT Pages</strong>
+                  </span>
 
-                <input
-                  type="text"
-                  name="compatibility"
-                  defaultValue={filters.compatibility}
-                  placeholder="Compatibility"
-                  style={filterInputStyle}
-                />
+                  <s-paragraph>
+                    Search and filter existing YMMT pages before selecting pages
+                    to manage.
+                  </s-paragraph>
 
-                <input
-                  type="text"
-                  name="warning"
-                  defaultValue={filters.warning}
-                  placeholder="Warning"
-                  style={filterInputStyle}
-                />
+                  <Form method="get">
+                    <div
+                      style={{
+                        marginTop: "18px",
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: "14px",
+                      }}
+                    >
+                      {/* General search */}
+                      <input
+                        type="text"
+                        name="search"
+                        defaultValue={filters.search}
+                        placeholder="Search by page title or handle"
+                        style={{
+                          width: "100%",
+                          boxSizing: "border-box",
+                          padding: "10px 12px",
+                          border: "1px solid #c9c9c9",
+                          borderRadius: "8px",
+                        }}
+                      />
 
-                <input
-                  type="text"
-                  name="productHandle"
-                  defaultValue={filters.productHandle}
-                  placeholder="Product handle"
-                  style={filterInputStyle}
-                />
-              </div>
+                      {/* Vehicle filters */}
+                      <div
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns:
+                            "repeat(auto-fit, minmax(180px, 1fr))",
+                          gap: "12px",
+                        }}
+                      >
+                        <input
+                          type="text"
+                          name="year"
+                          defaultValue={filters.year}
+                          placeholder="Year"
+                          style={filterInputStyle}
+                        />
 
-              {/* Status */}
-              <div
-                style={{
-                  display: "grid",
-                  gridTemplateColumns: "minmax(200px, 300px)",
-                }}
-              >
-                <select
-                  name="status"
-                  defaultValue={filters.status}
-                  style={filterInputStyle}
-                >
-                  <option value="">All statuses</option>
-                  <option value="published">Published</option>
-                  <option value="draft">Draft</option>
-                </select>
-              </div>
+                        <input
+                          type="text"
+                          name="make"
+                          defaultValue={filters.make}
+                          placeholder="Make"
+                          style={filterInputStyle}
+                        />
 
-              {/* Buttons */}
+                        <input
+                          type="text"
+                          name="model"
+                          defaultValue={filters.model}
+                          placeholder="Model"
+                          style={filterInputStyle}
+                        />
+
+                        <input
+                          type="text"
+                          name="trim"
+                          defaultValue={filters.trim}
+                          placeholder="Trim"
+                          style={filterInputStyle}
+                        />
+                      </div>
+
+                      {/* YMMT metadata filters */}
+                      <div
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns:
+                            "repeat(auto-fit, minmax(220px, 1fr))",
+                          gap: "12px",
+                        }}
+                      >
+                        <input
+                          type="text"
+                          name="manufacturer"
+                          defaultValue={filters.manufacturer}
+                          placeholder="Manufacturer"
+                          style={filterInputStyle}
+                        />
+
+                        <input
+                          type="text"
+                          name="compatibility"
+                          defaultValue={filters.compatibility}
+                          placeholder="Compatibility"
+                          style={filterInputStyle}
+                        />
+
+                        <input
+                          type="text"
+                          name="warning"
+                          defaultValue={filters.warning}
+                          placeholder="Warning"
+                          style={filterInputStyle}
+                        />
+
+                        <input
+                          type="text"
+                          name="productHandle"
+                          defaultValue={filters.productHandle}
+                          placeholder="Product handle"
+                          style={filterInputStyle}
+                        />
+                      </div>
+
+                      {/* Status */}
+                      <div
+                        style={{
+                          display: "grid",
+                          gridTemplateColumns: "minmax(200px, 300px)",
+                        }}
+                      >
+                        <select
+                          name="status"
+                          defaultValue={filters.status}
+                          style={filterInputStyle}
+                        >
+                          <option value="">All statuses</option>
+                          <option value="published">Published</option>
+                          <option value="draft">Draft</option>
+                        </select>
+                      </div>
+
+                      {/* Buttons */}
+                      <div
+                        style={{
+                          display: "flex",
+                          gap: "10px",
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <button
+                          type="submit"
+                          disabled={isSearching}
+                          style={{
+                            padding: "10px 16px",
+                            borderRadius: "8px",
+                            border: "none",
+                            background: isSearching ? "#8c8c8c" : "#303030",
+                            color: "#ffffff",
+                            fontWeight: "650",
+                            cursor: isSearching ? "wait" : "pointer",
+                          }}
+                        >
+                          {isSearching ? "Searching..." : "Search Pages"}
+                        </button>
+
+                        {Object.values(filters).some(Boolean) && (
+                          <Link
+                            to="/app/manage"
+                            style={{
+                              padding: "9px 15px",
+                              borderRadius: "8px",
+                              border: "1px solid #c9c9c9",
+                              color: "#303030",
+                              textDecoration: "none",
+                              fontWeight: "600",
+                            }}
+                          >
+                            Clear Filters
+                          </Link>
+                        )}
+                      </div>
+                    </div>
+                  </Form>
+                  {isSearching && (
+                    <div
+                      style={{
+                        padding: "18px",
+                        border: "1px solid #e3e3e3",
+                        borderRadius: "10px",
+                        background: "#fafafa",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "12px",
+                        marginTop: "18px",
+                      }}
+                    >
+                      <div
+                        style={{
+                          width: "18px",
+                          height: "18px",
+                          border: "2px solid #d0d0d0",
+                          borderTopColor: "#303030",
+                          borderRadius: "50%",
+                          animation: "ymmt-spin 0.8s linear infinite",
+                        }}
+                      />
+
+                      <div>
+                        <strong>Searching Shopify pages...</strong>
+                        <div
+                          style={{
+                            marginTop: "3px",
+                            fontSize: "13px",
+                            color: "#616161",
+                          }}
+                        >
+                          Checking YMMT pages against your selected filters.
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </s-section>
+              </>
+            )}
+            {searchMode === "json" && (
+              <s-section>
+                <strong>Find Pages From YMMT JSON</strong>
+
+                <s-paragraph>
+                  Upload the same YMMT JSON format used when creating pages.
+                  Existing Shopify pages will be matched by Year, Make, Model
+                  and Trim.
+                </s-paragraph>
+
+                <Form method="post" encType="multipart/form-data">
+                  <input type="hidden" name="intent" value="json-search" />
+
+                  <div
+                    style={{
+                      marginTop: "16px",
+                      display: "flex",
+                      flexDirection: "column",
+                      gap: "14px",
+                    }}
+                  >
+                    {/* Styled file picker keeps the browser input hidden while still
+                    submitting the real File object through the form. */}
+                    <div
+                      style={{
+                        border: "1px dashed #b8b8b8",
+                        borderRadius: "12px",
+                        padding: "20px",
+                        background: "#fafafa",
+                      }}
+                    >
+                      <label
+                        htmlFor="ymmtFile"
+                        style={{
+                          display: "inline-block",
+                          padding: "10px 16px",
+                          borderRadius: "8px",
+                          background: "#303030",
+                          color: "#ffffff",
+                          fontWeight: "650",
+                          cursor: isJsonSearching ? "wait" : "pointer",
+                          opacity: isJsonSearching ? 0.7 : 1,
+                        }}
+                      >
+                        Choose JSON File
+                      </label>
+
+                      <input
+                        id="ymmtFile"
+                        type="file"
+                        name="ymmtFile"
+                        accept=".json,application/json"
+                        required
+                        disabled={isJsonSearching}
+                        style={{ display: "none" }}
+                        onChange={(event) =>
+                          setJsonFileName(event.target.files?.[0]?.name || "")
+                        }
+                      />
+
+                      <div
+                        style={{
+                          marginTop: "10px",
+                          fontSize: "13px",
+                          color: "#616161",
+                        }}
+                      >
+                        {jsonFileName ? (
+                          <>
+                            Selected: <strong>{jsonFileName}</strong>
+                          </>
+                        ) : (
+                          "Choose the same YMMT JSON format used for page creation."
+                        )}
+                      </div>
+                    </div>
+
+                    <div>
+                      <button
+                        type="submit"
+                        disabled={isJsonSearching}
+                        style={{
+                          padding: "10px 16px",
+                          borderRadius: "8px",
+                          border: "none",
+                          background: isJsonSearching ? "#8c8c8c" : "#303030",
+                          color: "#ffffff",
+                          fontWeight: "650",
+                          cursor: isJsonSearching ? "wait" : "pointer",
+                        }}
+                      >
+                        {isJsonSearching
+                          ? "Searching Pages..."
+                          : "Find Pages From JSON"}
+                      </button>
+                    </div>
+                  </div>
+                </Form>
+
+                {/* JSON search runs as a POST upload, so show clear feedback while
+                the server parses the file and matches Shopify pages. */}
+                {isJsonSearching && (
+                  <div
+                    style={{
+                      marginTop: "14px",
+                      padding: "14px",
+                      background: "#fafafa",
+                      border: "1px solid #e3e3e3",
+                      borderRadius: "10px",
+                    }}
+                  >
+                    <strong>Searching Shopify pages...</strong>
+                    <div
+                      style={{
+                        marginTop: "4px",
+                        fontSize: "13px",
+                        color: "#616161",
+                      }}
+                    >
+                      Parsing the YMMT file and matching Year, Make, Model and
+                      Trim.
+                    </div>
+                  </div>
+                )}
+              </s-section>
+            )}
+          </>
+        )}
+        {/* Summary returned by the JSON-search action. */}
+        {actionData?.success && actionData.intent === "json-search" && (
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+              gap: "12px",
+            }}
+          >
+            <div>
+              <strong>{actionData.totalRecords}</strong>
+              <div>JSON Records</div>
+            </div>
+
+            <div>
+              <strong>{actionData.matched}</strong>
+              <div>Pages Found</div>
+            </div>
+
+            <div>
+              <strong>{actionData.missing}</strong>
+              <div>Missing Pages</div>
+            </div>
+          </div>
+        )}
+        {/* Step 2 Select Pages */}
+        {canShowResults &&
+          !isSearching &&
+          !isJsonSearching &&
+          step === "select" && (
+            <s-section>
               <div
                 style={{
                   display: "flex",
-                  gap: "10px",
-                  flexWrap: "wrap",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  gap: "12px",
+                  marginBottom: "14px",
                 }}
               >
-                <button
-                  type="submit"
-                  disabled={isSearching}
+                <div>
+                  <strong>Select Matching Pages</strong>
+                  <div
+                    style={{
+                      marginTop: "4px",
+                      color: "#616161",
+                      fontSize: "13px",
+                    }}
+                  >
+                    {resultPages.length} matching page
+                    {resultPages.length === 1 ? "" : "s"}
+                  </div>
+                </div>
+
+                <div
                   style={{
-                    padding: "10px 16px",
-                    borderRadius: "8px",
-                    border: "none",
-                    background: isSearching ? "#8c8c8c" : "#303030",
-                    color: "#ffffff",
-                    fontWeight: "650",
-                    cursor: isSearching ? "wait" : "pointer",
+                    display: "flex",
+                    gap: "8px",
+                    flexWrap: "wrap",
+                    justifyContent: "flex-end",
                   }}
                 >
-                  {isSearching ? "Searching..." : "Search Pages"}
-                </button>
-
-                {Object.values(filters).some(Boolean) && (
-                  <Link
-                    to="/app/manage"
+                  <button
+                    type="button"
+                    onClick={startNewSearch}
                     style={{
-                      padding: "9px 15px",
+                      padding: "8px 13px",
                       borderRadius: "8px",
                       border: "1px solid #c9c9c9",
-                      color: "#303030",
-                      textDecoration: "none",
+                      background: "#ffffff",
                       fontWeight: "600",
                     }}
                   >
-                    Clear Filters
-                  </Link>
-                )}
-              </div>
-            </div>
-          </Form>
-          {isSearching && (
-            <div
-              style={{
-                padding: "18px",
-                border: "1px solid #e3e3e3",
-                borderRadius: "10px",
-                background: "#fafafa",
-                display: "flex",
-                alignItems: "center",
-                gap: "12px",
-              }}
-            >
-              <div
-                style={{
-                  width: "18px",
-                  height: "18px",
-                  border: "2px solid #d0d0d0",
-                  borderTopColor: "#303030",
-                  borderRadius: "50%",
-                  animation: "ymmt-spin 0.8s linear infinite",
-                }}
-              />
+                    Change Search
+                  </button>
 
-              <div>
-                <strong>Searching Shopify pages...</strong>
-                <div
-                  style={{
-                    marginTop: "3px",
-                    fontSize: "13px",
-                    color: "#616161",
-                  }}
-                >
-                  Checking YMMT pages against your selected filters.
-                </div>
-              </div>
-            </div>
-          )}
-        </s-section>
+                  {resultPages.length > 0 && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          document
+                            .getElementById("selection-actions")
+                            ?.scrollIntoView({
+                              behavior: "smooth",
+                              block: "center",
+                            })
+                        }
+                        style={{
+                          padding: "8px 13px",
+                          borderRadius: "8px",
+                          border: "1px solid #c9c9c9",
+                          background: "#ffffff",
+                          fontWeight: "600",
+                        }}
+                      >
+                        Jump to Continue
+                      </button>
 
-        {/* Step 2 Select Pages */}
-        {hasFilters && !isSearching && step === "select" && (
-          <s-section>
-            <div
-              style={{
-                display: "flex",
-                justifyContent: "space-between",
-                alignItems: "center",
-                gap: "12px",
-                marginBottom: "14px",
-              }}
-            >
-              <div>
-                <strong>Select Matching Pages</strong>
-                <div
-                  style={{
-                    marginTop: "4px",
-                    color: "#616161",
-                    fontSize: "13px",
-                  }}
-                >
-                  {pages.length} matching page{pages.length === 1 ? "" : "s"}
+                      <button
+                        type="button"
+                        onClick={toggleAll}
+                        style={{
+                          padding: "8px 13px",
+                          borderRadius: "8px",
+                          border: "1px solid #c9c9c9",
+                          background: "#ffffff",
+                          fontWeight: "600",
+                        }}
+                      >
+                        {allSelected ? "Deselect All" : "Select All"}
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
 
-              {pages.length > 0 && (
-                <button
-                  type="button"
-                  onClick={toggleAll}
-                  style={{
-                    padding: "8px 13px",
-                    borderRadius: "8px",
-                    border: "1px solid #c9c9c9",
-                    background: "#ffffff",
-                    fontWeight: "600",
-                  }}
-                >
-                  {allSelected ? "Deselect All" : "Select All"}
-                </button>
-              )}
-            </div>
-
-            {pages.length > 0 ? (
-              <>
-                <div
-                  style={{
-                    overflowX: "auto",
-                    border: "1px solid #e3e3e3",
-                    borderRadius: "10px",
-                  }}
-                >
-                  <table
-                    style={{
-                      width: "100%",
-                      borderCollapse: "collapse",
-                    }}
-                  >
-                    <thead>
-                      <tr>
-                        <th style={tableHeaderStyle}>Select</th>
-                        <th align="left" style={tableHeaderStyle}>
-                          Title
-                        </th>
-                        <th align="left" style={tableHeaderStyle}>
-                          Year
-                        </th>
-                        <th align="left" style={tableHeaderStyle}>
-                          Make
-                        </th>
-                        <th align="left" style={tableHeaderStyle}>
-                          Model
-                        </th>
-                        <th align="left" style={tableHeaderStyle}>
-                          Trim
-                        </th>
-                        <th align="left" style={tableHeaderStyle}>
-                          Product
-                        </th>
-                        <th align="left" style={tableHeaderStyle}>
-                          Status
-                        </th>
-                      </tr>
-                    </thead>
-
-                    <tbody>
-                      {pages.map((page) => (
-                        <tr key={page.id}>
-                          <td style={tableCellStyle}>
-                            <input
-                              type="checkbox"
-                              checked={selectedIds.has(page.id)}
-                              onChange={() => togglePage(page.id)}
-                            />
-                          </td>
-
-                          <td style={tableCellStyle}>
-                            <strong>{page.title}</strong>
-                            <div
-                              style={{
-                                marginTop: "4px",
-                                fontSize: "12px",
-                                color: "#616161",
-                              }}
-                            >
-                              {page.handle}
-                            </div>
-                          </td>
-
-                          <td style={tableCellStyle}>{page.year || "—"}</td>
-                          <td style={tableCellStyle}>{page.make || "—"}</td>
-                          <td style={tableCellStyle}>{page.model || "—"}</td>
-                          <td style={tableCellStyle}>{page.trim || "—"}</td>
-
-                          <td style={tableCellStyle}>
-                            {page.productHandle || "—"}
-                          </td>
-
-                          <td style={tableCellStyle}>
-                            {page.isPublished ? "Published" : "Draft"}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-
-                <div
-                  style={{
-                    marginTop: "16px",
-                    display: "flex",
-                    justifyContent: "space-between",
-                    alignItems: "center",
-                    gap: "12px",
-                    flexWrap: "wrap",
-                  }}
-                >
+              {resultPages.length > 0 ? (
+                <>
                   <div
                     style={{
-                      fontSize: "13px",
-                      color: "#616161",
+                      overflowX: "auto",
+                      border: "1px solid #e3e3e3",
+                      borderRadius: "10px",
                     }}
                   >
-                    {selectedIds.size} selected
+                    <table
+                      style={{
+                        width: "100%",
+                        borderCollapse: "collapse",
+                      }}
+                    >
+                      <thead>
+                        <tr>
+                          <th style={tableHeaderStyle}>Select</th>
+                          <th align="left" style={tableHeaderStyle}>
+                            Title
+                          </th>
+                          <th align="left" style={tableHeaderStyle}>
+                            Year
+                          </th>
+                          <th align="left" style={tableHeaderStyle}>
+                            Make
+                          </th>
+                          <th align="left" style={tableHeaderStyle}>
+                            Model
+                          </th>
+                          <th align="left" style={tableHeaderStyle}>
+                            Trim
+                          </th>
+                          <th align="left" style={tableHeaderStyle}>
+                            Product
+                          </th>
+                          <th align="left" style={tableHeaderStyle}>
+                            Status
+                          </th>
+                        </tr>
+                      </thead>
+
+                      <tbody>
+                        {resultPages.map((page) => (
+                          <tr key={page.id}>
+                            <td style={tableCellStyle}>
+                              <input
+                                type="checkbox"
+                                checked={selectedIds.has(page.id)}
+                                onChange={() => togglePage(page.id)}
+                              />
+                            </td>
+
+                            <td style={tableCellStyle}>
+                              <strong>{page.title}</strong>
+                              <div
+                                style={{
+                                  marginTop: "4px",
+                                  fontSize: "12px",
+                                  color: "#616161",
+                                }}
+                              >
+                                {page.handle}
+                              </div>
+                            </td>
+
+                            <td style={tableCellStyle}>{page.year || "—"}</td>
+                            <td style={tableCellStyle}>{page.make || "—"}</td>
+                            <td style={tableCellStyle}>{page.model || "—"}</td>
+                            <td style={tableCellStyle}>{page.trim || "—"}</td>
+
+                            <td style={tableCellStyle}>
+                              {page.productHandle || "—"}
+                            </td>
+
+                            <td style={tableCellStyle}>
+                              {page.isPublished ? "Published" : "Draft"}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
                   </div>
 
-                  <button
-                    type="button"
-                    disabled={selectedIds.size === 0}
+                  <div
+                    id="selection-actions"
                     style={{
-                      padding: "10px 16px",
-                      borderRadius: "8px",
-                      border: "none",
-                      background: isSearching ? "#8c8c8c" : "#303030",
-                      color: "#ffffff",
-                      fontWeight: "650",
-                      cursor: isSearching ? "wait" : "pointer",
+                      marginTop: "16px",
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      gap: "12px",
+                      flexWrap: "wrap",
                     }}
-                    onClick={() => setStep("action")}
                   >
-                    Continue with {selectedIds.size} selected
-                  </button>
+                    <div
+                      style={{
+                        fontSize: "13px",
+                        color: "#616161",
+                      }}
+                    >
+                      {selectedIds.size} selected
+                    </div>
+
+                    <button
+                      type="button"
+                      disabled={selectedIds.size === 0}
+                      style={{
+                        padding: "10px 16px",
+                        borderRadius: "8px",
+                        border: "none",
+                        background:
+                          selectedIds.size === 0 ? "#b5b5b5" : "#303030",
+                        color: "#ffffff",
+                        fontWeight: "650",
+                        cursor:
+                          selectedIds.size === 0 ? "not-allowed" : "pointer",
+                      }}
+                      onClick={() => setStep("action")}
+                    >
+                      Continue with {selectedIds.size} selected
+                    </button>
+                  </div>
+                </>
+              ) : (
+                <div
+                  style={{
+                    padding: "24px",
+                    border: "1px dashed #c9c9c9",
+                    borderRadius: "10px",
+                    textAlign: "center",
+                    color: "#616161",
+                  }}
+                >
+                  No matching YMMT pages found.
                 </div>
-              </>
-            ) : (
-              <div
-                style={{
-                  padding: "24px",
-                  border: "1px dashed #c9c9c9",
-                  borderRadius: "10px",
-                  textAlign: "center",
-                  color: "#616161",
-                }}
-              >
-                No matching YMMT pages found.
-              </div>
-            )}
-          </s-section>
-        )}
+              )}
+            </s-section>
+          )}
 
         {/* Step 3 choose action */}
-        {hasFilters && step === "action" && (
+        {canShowResults && step === "action" && (
           <s-section>
             <div style={{ marginBottom: "16px" }}>
               <strong>Choose Action</strong>
@@ -1006,7 +1564,7 @@ export default function ManagePages() {
         )}
 
         {/* Step 4 Review Selected pages and Confirm */}
-        {hasFilters && step === "review" && (
+        {canShowResults && step === "review" && (
           <s-section>
             <div style={{ marginBottom: "16px" }}>
               <strong>Review Changes</strong>
@@ -1147,7 +1705,7 @@ export default function ManagePages() {
                 </thead>
 
                 <tbody>
-                  {pages
+                  {resultPages
                     .filter((page) => selectedIds.has(page.id))
                     .map((page) => (
                       <tr key={page.id}>
@@ -1266,7 +1824,7 @@ export default function ManagePages() {
         )}
 
         {/* logs */}
-        {(isSubmitting || actionData?.success) && (
+        {shouldShowOperationLogs && (
           <s-section>
             <div
               style={{
@@ -1300,6 +1858,9 @@ export default function ManagePages() {
               {actionLogs.map((log, index) => {
                 const failed = log.startsWith("[FAILED]");
                 const success = log.startsWith("[SUCCESS]");
+                const skipped = log.startsWith("[SKIPPED]");
+                const info = log.startsWith("[INFO]");
+                const start = log.startsWith("[START]");
 
                 return (
                   <div
@@ -1312,7 +1873,13 @@ export default function ManagePages() {
                         ? "#ff8a7a"
                         : success
                           ? "#6fdc8c"
-                          : "#f2f2f2",
+                          : skipped
+                            ? "#ffd27a"
+                            : info
+                              ? "#9ecbff"
+                              : start
+                                ? "#ffffff"
+                                : "#f2f2f2",
                     }}
                   >
                     {log}
@@ -1347,40 +1914,59 @@ export default function ManagePages() {
           </div>
         )}
 
-        {actionData?.success && (
-          <div
-            style={{
-              padding: "14px",
-              background: "#f1fff2",
-              border: "1px solid #b7ddb9",
-              borderRadius: "10px",
-            }}
-          >
-            {actionData.intent === "update-product" && (
-              <>
-                Product handles updated: <strong>{actionData.updated}</strong>
-                {" · "}
-                Failed: <strong>{actionData.failed}</strong>
-              </>
-            )}
+        {actionData?.success &&
+          [
+            "update-product",
+            "update-content",
+            "delete",
+            "rollback-session",
+          ].includes(actionData.intent) && (
+            <div
+              style={{
+                padding: "14px",
+                background: "#f1fff2",
+                border: "1px solid #b7ddb9",
+                borderRadius: "10px",
+              }}
+            >
+              {actionData.intent === "update-product" && (
+                <>
+                  Product handles updated:{" "}
+                  <strong>{actionData.updated ?? 0}</strong>
+                  {" · "}
+                  Failed: <strong>{actionData.failed ?? 0}</strong>
+                </>
+              )}
 
-            {actionData.intent === "update-content" && (
-              <>
-                Page content updated: <strong>{actionData.updated}</strong>
-                {" · "}
-                Failed: <strong>{actionData.failed}</strong>
-              </>
-            )}
+              {actionData.intent === "update-content" && (
+                <>
+                  Page content updated:{" "}
+                  <strong>{actionData.updated ?? 0}</strong>
+                  {" · "}
+                  Failed: <strong>{actionData.failed ?? 0}</strong>
+                </>
+              )}
 
-            {actionData.intent === "delete" && (
-              <>
-                Deleted: <strong>{actionData.deleted}</strong>
-                {" · "}
-                Failed: <strong>{actionData.failed}</strong>
-              </>
-            )}
-          </div>
-        )}
+              {actionData.intent === "delete" && (
+                <>
+                  Deleted: <strong>{actionData.deleted ?? 0}</strong>
+                  {" · "}
+                  Failed: <strong>{actionData.failed ?? 0}</strong>
+                </>
+              )}
+
+              {actionData.intent === "rollback-session" && (
+                <>
+                  Rollback completed. Restored:{" "}
+                  <strong>{actionData.restored ?? 0}</strong>
+                  {" · "}
+                  Skipped: <strong>{actionData.skipped ?? 0}</strong>
+                  {" · "}
+                  Failed: <strong>{actionData.failed ?? 0}</strong>
+                </>
+              )}
+            </div>
+          )}
 
         {actionData?.success &&
           actionData.intent === "delete" &&
@@ -1602,6 +2188,9 @@ export default function ManagePages() {
                     <th align="left" style={tableHeaderStyle}>
                       Status
                     </th>
+                    <th align="left" style={tableHeaderStyle}>
+                      Actions
+                    </th>
                   </tr>
                 </thead>
 
@@ -1609,10 +2198,30 @@ export default function ManagePages() {
                   {recentSessions.map((session) => (
                     <tr key={session.id}>
                       <td style={tableCellStyle}>
-                        {new Date(session.createdAt).toLocaleString()}
+                        <code
+                          style={{
+                            fontSize: "12px",
+                            color: "#444",
+                          }}
+                        >
+                          {new Date(session.createdAt).toLocaleString()}
+                        </code>
                       </td>
 
-                      <td style={tableCellStyle}>{session.actionType}</td>
+                      <td style={tableCellStyle}>
+                        <span
+                          style={{
+                            display: "inline-block",
+                            padding: "0px 8px",
+                            borderRadius: "999px",
+                            background: "#f1f1f1",
+                            fontSize: "12px",
+                            fontWeight: "600",
+                          }}
+                        >
+                          {session.actionType}
+                        </span>
+                      </td>
 
                       <td style={tableCellStyle}>{session.totalPages}</td>
 
@@ -1620,7 +2229,52 @@ export default function ManagePages() {
 
                       <td style={tableCellStyle}>{session.failedCount}</td>
 
-                      <td style={tableCellStyle}>{session.status}</td>
+                      <td style={tableCellStyle}>
+                        <span
+                          style={{
+                            display: "inline-block",
+                            padding: "0px 8px",
+                            borderRadius: "999px",
+                            fontSize: "12px",
+                            fontWeight: "650",
+                            background:
+                              session.status === "rolled_back"
+                                ? "#fff4d6"
+                                : session.status === "completed"
+                                  ? "#eaf7ec"
+                                  : "#f1f1f1",
+                            color:
+                              session.status === "rolled_back"
+                                ? "#7a5a00"
+                                : session.status === "completed"
+                                  ? "#176b35"
+                                  : "#303030",
+                          }}
+                        >
+                          {session.status.replaceAll("_", " ")}
+                        </span>
+                      </td>
+
+                      <td style={tableCellStyle}>
+                        <Link
+                          to={`/app/manage?sessionId=${session.id}`}
+                          style={{
+                            display: "inline-flex",
+                            alignItems: "center",
+                            justifyContent: "center",
+                            padding: "7px 12px",
+                            borderRadius: "7px",
+                            border: "1px solid #c9c9c9",
+                            background: "#ffffff",
+                            color: "#303030",
+                            textDecoration: "none",
+                            fontSize: "12px",
+                            fontWeight: "650",
+                          }}
+                        >
+                          View Changes
+                        </Link>
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -1630,6 +2284,146 @@ export default function ManagePages() {
             <s-paragraph>No change sessions recorded yet.</s-paragraph>
           )}
         </s-section>
+        {selectedSession && (
+          <s-section>
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                gap: "12px",
+                marginBottom: "14px",
+              }}
+            >
+              <div>
+                <strong>Session Details</strong>
+
+                <div
+                  style={{
+                    marginTop: "4px",
+                    color: "#616161",
+                    fontSize: "13px",
+                  }}
+                >
+                  {selectedSession.actionType}
+                  {" · "}
+                  {new Date(selectedSession.createdAt).toLocaleString()}
+                </div>
+              </div>
+
+              <div
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "10px",
+                }}
+              >
+                {!selectedSession.rolledBackAt && (
+                  <Form method="post">
+                    <input
+                      type="hidden"
+                      name="intent"
+                      value="rollback-session"
+                    />
+
+                    <input
+                      type="hidden"
+                      name="sessionId"
+                      value={selectedSession.id}
+                    />
+
+                    <button
+                      type="submit"
+                      onClick={(event) => {
+                        const confirmed = window.confirm(
+                          `Rollback all reversible changes from this session?`,
+                        );
+
+                        if (!confirmed) {
+                          event.preventDefault();
+                        }
+                      }}
+                      style={{
+                        padding: "9px 14px",
+                        borderRadius: "8px",
+                        border: "1px solid #c9c9c9",
+                        background: "#ffffff",
+                        fontWeight: "650",
+                        cursor: "pointer",
+                      }}
+                    >
+                      Rollback Session
+                    </button>
+                  </Form>
+                )}
+
+                {selectedSession.rolledBackAt && (
+                  <span
+                    style={{
+                      fontSize: "13px",
+                      fontWeight: "600",
+                    }}
+                  >
+                    ✓ Rolled Back
+                  </span>
+                )}
+
+                <Link to="/app/manage">Close</Link>
+              </div>
+            </div>
+
+            <div
+              style={{
+                overflowX: "auto",
+                border: "1px solid #e3e3e3",
+                borderRadius: "10px",
+              }}
+            >
+              <table
+                style={{
+                  width: "100%",
+                  borderCollapse: "collapse",
+                }}
+              >
+                <thead>
+                  <tr>
+                    <th align="left" style={tableHeaderStyle}>
+                      Page
+                    </th>
+                    <th align="left" style={tableHeaderStyle}>
+                      Action
+                    </th>
+                    <th align="left" style={tableHeaderStyle}>
+                      Status
+                    </th>
+                    <th align="left" style={tableHeaderStyle}>
+                      Rollback
+                    </th>
+                  </tr>
+                </thead>
+
+                <tbody>
+                  {selectedSession.changes.map((change) => (
+                    <tr key={change.id}>
+                      <td style={tableCellStyle}>
+                        <code>{change.handle}</code>
+                      </td>
+
+                      <td style={tableCellStyle}>{change.action}</td>
+
+                      <td style={tableCellStyle}>{change.status}</td>
+
+                      <td style={tableCellStyle}>
+                        {change.rolledBackAt
+                          ? "Rolled back"
+                          : "Not rolled back"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </s-section>
+        )}
       </div>
     </s-page>
   );

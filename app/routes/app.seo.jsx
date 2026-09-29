@@ -549,6 +549,15 @@ export default function SeoMeta() {
                       : new Set(pages.map((page) => page.id)),
                   )
                 }
+                style={{
+                  display: "inline-block",
+                  background: "#303030",
+                  color: "#ffffff",
+                  textDecoration: "none",
+                  padding: "11px 18px",
+                  borderRadius: "8px",
+                  fontWeight: "650",
+                }}
               >
                 {allSelected ? "Deselect All" : "Select All"}
               </button>

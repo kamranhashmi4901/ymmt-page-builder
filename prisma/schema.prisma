@@ -34,7 +34,7 @@ model Session {
 }
 
 model YmmtUpload {
-  id                  String   @id @default(cuid())
+  id                  String              @id @default(cuid())
   shop                String
   fileName            String
   fileHash            String
@@ -46,8 +46,9 @@ model YmmtUpload {
   withTrim            Int
   withoutTrim         Int
   sourceProductHandle String?
-  createdAt           DateTime @default(now())
-  updatedAt           DateTime @updatedAt
+  sourceProducts      YmmtUploadProduct[]
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
 
   records YmmtRecord[]
 
@@ -74,6 +75,22 @@ model YmmtRecord {
 
   @@index([uploadId])
   @@index([year, make, model])
+}
+
+model YmmtUploadProduct {
+  id String @id @default(cuid())
+
+  uploadId  String
+  productId String?
+  title     String?
+  handle    String
+
+  createdAt DateTime @default(now())
+
+  upload YmmtUpload @relation(fields: [uploadId], references: [id], onDelete: Cascade)
+
+  @@unique([uploadId, handle])
+  @@index([uploadId])
 }
 
 model YmmtJob {

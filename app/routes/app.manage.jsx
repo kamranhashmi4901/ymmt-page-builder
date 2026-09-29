@@ -16,6 +16,7 @@ import {
   updateYMMTProductHandle,
   updateYMMTPageContent,
   restoreShopifyPageSnapshot,
+  recreateShopifyPageFromSnapshot,
   searchYMMTPagesByRecords,
 } from "../lib/shopify-manage-pages.server";
 
@@ -137,11 +138,19 @@ export const action = async ({ request }) => {
         const snapshot = JSON.parse(change.beforeData);
 
         if (change.action === "delete") {
+          const recreatedPage = await recreateShopifyPageFromSnapshot(
+            admin,
+            snapshot,
+          );
+
+          await markChangeRolledBack(change.id);
+
           rollbackResults.push({
             changeId: change.id,
-            status: "skipped",
-            message:
-              "Delete rollback requires page recreation and will be added separately.",
+            status: "restored",
+            handle: recreatedPage.handle,
+            recreatedPageId: recreatedPage.id,
+            message: "Deleted page recreated successfully.",
           });
 
           continue;
@@ -640,7 +649,9 @@ export default function ManagePages() {
       actionData.rollbackResults?.forEach((result) => {
         if (result.status === "restored") {
           actionLogs.push(
-            `[SUCCESS] Restored ${result.handle || result.changeId}`,
+            result.recreatedPageId
+              ? `[SUCCESS] Recreated deleted page: ${result.handle}`
+              : `[SUCCESS] Restored: ${result.handle || result.changeId}`,
           );
         } else if (result.status === "skipped") {
           actionLogs.push(
@@ -1251,11 +1262,13 @@ export default function ManagePages() {
                         type="button"
                         onClick={toggleAll}
                         style={{
-                          padding: "8px 13px",
+                          display: "inline-block",
+                          background: "#303030",
+                          color: "#ffffff",
+                          textDecoration: "none",
+                          padding: "11px 18px",
                           borderRadius: "8px",
-                          border: "1px solid #c9c9c9",
-                          background: "#ffffff",
-                          fontWeight: "600",
+                          fontWeight: "650",
                         }}
                       >
                         {allSelected ? "Deselect All" : "Select All"}

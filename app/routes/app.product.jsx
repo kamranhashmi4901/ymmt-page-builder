@@ -2,26 +2,46 @@ import { useState } from "react";
 import {
   Form,
   Link,
+  redirect,
   useActionData,
   useLoaderData,
   useNavigation,
 } from "react-router";
 
 import { authenticate } from "../shopify.server";
+
+import { getYMMTUpload, setSourceProducts } from "../lib/ymmt-uploads.server";
+
 import {
-  getYMMTUpload,
-  setSourceProductHandle,
-} from "../lib/ymmt-uploads.server";
+  UploadIcon,
+  ProductIcon,
+  FilterIcon,
+  CheckCircleIcon,
+  PageAddIcon,
+} from "@shopify/polaris-icons";
+
+/* =========================================================
+   LOADER
+   ---------------------------------------------------------
+   Loads:
+   - current YMMT upload
+   - products already selected for this upload
+   - Shopify product search results
+========================================================= */
 
 export const loader = async ({ request }) => {
   const { session, admin } = await authenticate.admin(request);
 
   const url = new URL(request.url);
+
   const uploadId = url.searchParams.get("uploadId");
+
   const search = url.searchParams.get("search")?.trim() || "";
 
   if (!uploadId) {
-    throw new Response("Upload ID is required.", { status: 400 });
+    throw new Response("Upload ID is required.", {
+      status: 400,
+    });
   }
 
   const upload = await getYMMTUpload({
@@ -30,16 +50,25 @@ export const loader = async ({ request }) => {
   });
 
   if (!upload) {
-    throw new Response("YMMT upload not found.", { status: 404 });
+    throw new Response("YMMT upload not found.", {
+      status: 404,
+    });
   }
 
   let products = [];
 
+  /*
+   * Only search Shopify when the user
+   * actually enters a product search.
+   */
   if (search) {
     const response = await admin.graphql(
       `#graphql
         query SearchProducts($query: String!) {
-          products(first: 20, query: $query) {
+          products(
+            first: 20
+            query: $query
+          ) {
             nodes {
               id
               title
@@ -58,32 +87,57 @@ export const loader = async ({ request }) => {
 
     const json = await response.json();
 
+    if (json.errors?.length) {
+      throw new Error(json.errors.map((error) => error.message).join(", "));
+    }
+
     products = json.data?.products?.nodes || [];
   }
 
   return {
     upload: {
       id: upload.id,
+
       fileName: upload.fileName,
+
       totalRecords: upload.totalRecords,
+
       totalYears: upload.totalYears,
+
       totalMakes: upload.totalMakes,
+
       totalModels: upload.totalModels,
+
       totalTrims: upload.totalTrims,
-      sourceProductHandle: upload.sourceProductHandle,
+
+      /*
+       * These products come from Prisma.
+       *
+       * There is no fixed limit.
+       */
+      sourceProducts: upload.sourceProducts || [],
     },
+
     products,
+
     search,
   };
 };
+
+/* =========================================================
+   ACTION
+   ---------------------------------------------------------
+   Saves the selected products for this YMMT upload.
+========================================================= */
 
 export const action = async ({ request }) => {
   const { session } = await authenticate.admin(request);
 
   const formData = await request.formData();
 
-  const uploadId = formData.get("uploadId");
-  const mode = formData.get("mode");
+  const uploadId = String(formData.get("uploadId") || "");
+
+  const mode = String(formData.get("mode") || "");
 
   if (!uploadId) {
     return {
@@ -104,104 +158,263 @@ export const action = async ({ request }) => {
     };
   }
 
-  let handle = null;
+  /* =====================================================
+     SKIP PRODUCT SUFFIX
+  ===================================================== */
 
-  if (mode !== "skip") {
-    handle = String(formData.get("productHandle") || "")
-      .trim()
-      .toLowerCase();
+  if (mode === "skip") {
+    await setSourceProducts({
+      uploadId,
+      shop: session.shop,
+      products: [],
+    });
 
-    if (!handle) {
-      return {
-        success: false,
-        error: "Please select or enter a product handle.",
-      };
-    }
-
-    if (!/^[a-z0-9-]+$/.test(handle)) {
-      return {
-        success: false,
-        error:
-          "Product handle can only contain lowercase letters, numbers, and hyphens.",
-      };
-    }
+    return redirect(`/app/filter?uploadId=${encodeURIComponent(uploadId)}`);
   }
 
-  await setSourceProductHandle({
+  /* =====================================================
+     SAVE SELECTED PRODUCTS
+  ===================================================== */
+
+  if (mode !== "select") {
+    return {
+      success: false,
+      error: "Unknown product action.",
+    };
+  }
+
+  const rawProducts = formData.getAll("selectedProducts");
+
+  let selectedProducts = [];
+
+  try {
+    selectedProducts = rawProducts.map((value) => {
+      const product = JSON.parse(String(value));
+
+      return {
+        productId: String(product.productId || ""),
+
+        title: String(product.title || ""),
+
+        handle: String(product.handle || "")
+          .trim()
+          .toLowerCase(),
+      };
+    });
+  } catch {
+    return {
+      success: false,
+      error: "Unable to read selected products.",
+    };
+  }
+
+  /*
+   * Remove empty handles.
+   */
+  selectedProducts = selectedProducts.filter((product) => product.handle);
+
+  /*
+   * Remove duplicate products.
+   */
+  selectedProducts = Array.from(
+    new Map(
+      selectedProducts.map((product) => [product.handle, product]),
+    ).values(),
+  );
+
+  if (selectedProducts.length === 0) {
+    return {
+      success: false,
+      error: "Please select at least one product.",
+    };
+  }
+
+  /*
+   * Shopify product handles should
+   * contain lowercase letters,
+   * numbers and hyphens.
+   */
+  const invalid = selectedProducts.find(
+    (product) => !/^[a-z0-9-]+$/.test(product.handle),
+  );
+
+  if (invalid) {
+    return {
+      success: false,
+
+      error: `Invalid product handle: ${invalid.handle}`,
+    };
+  }
+
+  await setSourceProducts({
     uploadId,
     shop: session.shop,
-    sourceProductHandle: handle,
+    products: selectedProducts,
   });
 
-  return {
-    success: true,
-    uploadId,
-    productHandle: handle,
-  };
+  return redirect(`/app/filter?uploadId=${encodeURIComponent(uploadId)}`);
 };
 
-import {
-  UploadIcon,
-  ProductIcon,
-  FilterIcon,
-  CheckCircleIcon,
-  PageAddIcon,
-} from "@shopify/polaris-icons";
+/* =========================================================
+   PAGE STEP INDICATOR
+========================================================= */
 
 const steps = [
   {
     label: "Upload Data",
+
     icon: UploadIcon,
   },
+
   {
-    label: "Select Product",
+    label: "Select Products",
+
     icon: ProductIcon,
   },
+
   {
     label: "Filter & Preview",
+
     icon: FilterIcon,
   },
+
   {
     label: "Review & Select",
+
     icon: CheckCircleIcon,
   },
+
   {
     label: "Create Pages",
+
     icon: PageAddIcon,
   },
 ];
 
 const cardStyle = {
   background: "#ffffff",
+
   border: "1px solid #e3e3e3",
+
   borderRadius: "12px",
+
   padding: "18px",
 };
 
+const primaryButtonStyle = {
+  padding: "10px 16px",
+
+  borderRadius: "8px",
+
+  border: "none",
+
+  background: "#303030",
+
+  color: "#ffffff",
+
+  fontWeight: "650",
+
+  cursor: "pointer",
+};
+
+/* =========================================================
+   COMPONENT
+========================================================= */
+
 export default function ProductSelection() {
   const { upload, products, search } = useLoaderData();
+
   const actionData = useActionData();
+
   const navigation = useNavigation();
+
+  const isSubmitting = navigation.state === "submitting";
 
   const [showPicker, setShowPicker] = useState(Boolean(search));
 
-  const isSubmitting = navigation.state === "submitting";
+  /*
+   * Map is useful here because:
+   *
+   * handle -> product
+   *
+   * automatically gives us fast
+   * duplicate-free product selection.
+   */
+  const [selectedProducts, setSelectedProducts] = useState(() => {
+    return new Map(
+      (upload.sourceProducts || []).map((product) => [
+        product.handle,
+
+        {
+          productId: product.productId || "",
+
+          title: product.title || product.handle,
+
+          handle: product.handle,
+        },
+      ]),
+    );
+  });
+
+  const toggleProduct = (product) => {
+    setSelectedProducts((current) => {
+      const next = new Map(current);
+
+      if (next.has(product.handle)) {
+        next.delete(product.handle);
+      } else {
+        next.set(
+          product.handle,
+
+          {
+            productId: product.id,
+
+            title: product.title,
+
+            handle: product.handle,
+          },
+        );
+      }
+
+      return next;
+    });
+  };
+
+  const removeProduct = (handle) => {
+    setSelectedProducts((current) => {
+      const next = new Map(current);
+
+      next.delete(handle);
+
+      return next;
+    });
+  };
+
+  const selectedProductList = Array.from(selectedProducts.values());
 
   return (
     <s-page heading="Create YMMT Pages">
       <div
         style={{
           display: "flex",
+
           flexDirection: "column",
+
           gap: "24px",
         }}
       >
-        {/* Workflow steps */}
+        {/* =================================================
+            WORKFLOW STEPS
+        ================================================= */}
+
         <div
           style={{
             display: "flex",
+
             alignItems: "center",
+
             gap: "8px",
+
             flexWrap: "wrap",
           }}
         >
@@ -209,35 +422,34 @@ export default function ProductSelection() {
             const Icon = step.icon;
 
             const isActive = index === 1;
-            // Upload = 0
-            // Product = 1
-            // Filter = 2
-            // Review = 3
-            // Create = 4
 
             return (
               <div
                 key={step.label}
                 style={{
                   display: "flex",
+
                   alignItems: "center",
+
                   gap: "8px",
                 }}
               >
                 <div
                   style={{
                     width: "160px",
+
                     height: "40px",
 
                     display: "flex",
+
                     alignItems: "center",
+
                     justifyContent: "center",
+
                     gap: "7px",
 
-                    padding: "0 10px",
-                    boxSizing: "border-box",
-
                     borderRadius: "9px",
+
                     border: isActive
                       ? "1px solid #303030"
                       : "1px solid #d8d8d8",
@@ -246,19 +458,18 @@ export default function ProductSelection() {
 
                     color: isActive ? "#ffffff" : "#616161",
 
-                    fontSize: "14px",
                     fontWeight: isActive ? "650" : "500",
-
-                    whiteSpace: "nowrap",
                   }}
                 >
                   <span
                     style={{
                       width: "16px",
+
                       height: "16px",
+
                       display: "inline-flex",
+
                       fill: isActive ? "#ffffff" : "#616161",
-                      flexShrink: 0,
                     }}
                   >
                     <Icon />
@@ -267,175 +478,185 @@ export default function ProductSelection() {
                   <span>{step.label}</span>
                 </div>
 
-                {index < steps.length - 1 && (
-                  <span
-                    style={{
-                      color: "#8a8a8a",
-                      fontSize: "14px",
-                      lineHeight: 1,
-                    }}
-                  >
-                    →
-                  </span>
-                )}
+                {index < steps.length - 1 && <span>→</span>}
               </div>
             );
           })}
         </div>
 
-        {/* Upload summary */}
+        {/* =================================================
+            CURRENT UPLOAD
+        ================================================= */}
+
         <s-section>
-          <span
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: "7px",
-            }}
-          >
-            <s-icon type="upload" />
-            <strong>Current YMMT Upload</strong>
-          </span>
+          <strong>Current YMMT Upload</strong>
+
           <div
             style={{
+              marginTop: "14px",
+
               display: "grid",
+
               gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))",
+
               gap: "12px",
             }}
           >
             <div style={cardStyle}>
-              <div style={{ color: "#616161", fontSize: "13px" }}>File</div>
-              <div
-                style={{
-                  marginTop: "5px",
-                  fontWeight: "650",
-                  wordBreak: "break-word",
-                }}
-              >
-                {upload.fileName}
-              </div>
+              <div>File</div>
+
+              <strong>{upload.fileName}</strong>
             </div>
 
             <div style={cardStyle}>
-              <div style={{ color: "#616161", fontSize: "13px" }}>Records</div>
-              <div
-                style={{
-                  fontSize: "22px",
-                  marginTop: "5px",
-                  fontWeight: "700",
-                }}
-              >
-                {upload.totalRecords}
-              </div>
+              <div>Records</div>
+
+              <strong>{upload.totalRecords}</strong>
             </div>
 
             <div style={cardStyle}>
-              <div style={{ color: "#616161", fontSize: "13px" }}>Makes</div>
-              <div
-                style={{
-                  fontSize: "22px",
-                  marginTop: "5px",
-                  fontWeight: "700",
-                }}
-              >
-                {upload.totalMakes}
-              </div>
+              <div>Makes</div>
+
+              <strong>{upload.totalMakes}</strong>
             </div>
 
             <div style={cardStyle}>
-              <div style={{ color: "#616161", fontSize: "13px" }}>Models</div>
-              <div
-                style={{
-                  fontSize: "22px",
-                  marginTop: "5px",
-                  fontWeight: "700",
-                }}
-              >
-                {upload.totalModels}
-              </div>
+              <div>Models</div>
+
+              <strong>{upload.totalModels}</strong>
             </div>
           </div>
         </s-section>
 
-        {/* Main product selector */}
+        {/* =================================================
+            PRODUCT SELECTION
+        ================================================= */}
+
         <div
           style={{
             display: "grid",
+
             gridTemplateColumns: "minmax(0, 2fr) minmax(280px, 1fr)",
+
             gap: "20px",
+
             alignItems: "start",
           }}
         >
           <s-section>
-            <span
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: "7px",
-              }}
-            >
-              <s-icon type="product" />
-              <strong>Select Product Handle</strong>
-            </span>
+            <strong>Select Product Handles</strong>
+
             <s-paragraph>
-              Choose the Shopify product handle that should be appended to
-              generated YMMT page URLs.
+              Select one or more Shopify products. The app will create one YMMT
+              page for each selected vehicle and product combination.
             </s-paragraph>
 
-            {upload.sourceProductHandle && (
+            {/* =============================================
+                CURRENT PRODUCT SELECTION
+            ============================================= */}
+
+            {selectedProductList.length > 0 && (
               <div
                 style={{
                   marginTop: "16px",
-                  padding: "12px 14px",
+
+                  padding: "14px",
+
                   background: "#f4f6f8",
+
                   border: "1px solid #dedede",
+
                   borderRadius: "10px",
                 }}
               >
-                Current product: <strong>{upload.sourceProductHandle}</strong>
+                <strong>
+                  Selected Products ({selectedProductList.length})
+                </strong>
+
+                <div
+                  style={{
+                    marginTop: "10px",
+
+                    display: "flex",
+
+                    flexWrap: "wrap",
+
+                    gap: "8px",
+                  }}
+                >
+                  {selectedProductList.map((product) => (
+                    <button
+                      key={product.handle}
+
+                      type="button"
+
+                      onClick={() => removeProduct(product.handle)}
+
+                      style={{
+                        padding: "7px 10px",
+
+                        borderRadius: "999px",
+
+                        border: "1px solid #c9c9c9",
+
+                        background: "#ffffff",
+
+                        cursor: "pointer",
+                      }}
+                    >
+                      {product.title} ×
+                    </button>
+                  ))}
+                </div>
               </div>
             )}
+
+            {/* =============================================
+                OPEN PRODUCT PICKER
+            ============================================= */}
 
             {!showPicker && (
               <div
                 style={{
                   marginTop: "20px",
+
                   display: "flex",
-                  flexWrap: "wrap",
+
                   gap: "10px",
                 }}
               >
-                <s-button
+                <button
                   type="button"
+
                   onClick={() => setShowPicker(true)}
-                  style={{
-                    padding: "10px 18px",
-                    borderRadius: "8px",
-                    border: "none",
-                    background: "#303030",
-                    color: "#ffffff",
-                    fontWeight: "650",
-                    cursor: "pointer",
-                  }}
-                  icon="product"
+
+                  style={primaryButtonStyle}
                 >
-                  Select Product
-                </s-button>
+                  Select Products
+                </button>
 
                 <Form method="post">
-                  <input type="hidden" name="uploadId" value={upload.id} />
+                  <input
+                    type="hidden"
+
+                    name="uploadId"
+
+                    value={upload.id}
+                  />
 
                   <button
                     type="submit"
                     name="mode"
                     value="skip"
-                    disabled={isSubmitting}
                     style={{
-                      padding: "10px 18px",
+                      padding: "9px 14px",
                       borderRadius: "8px",
                       border: "1px solid #c9c9c9",
                       background: "#ffffff",
+                      fontWeight: "650",
                       cursor: "pointer",
                     }}
+                    disabled={isSubmitting}
                   >
                     Skip — No Product Suffix
                   </button>
@@ -443,63 +664,74 @@ export default function ProductSelection() {
               </div>
             )}
 
+            {/* =============================================
+                PRODUCT PICKER
+            ============================================= */}
+
             {showPicker && (
-              <div style={{ marginTop: "20px" }}>
+              <div
+                style={{
+                  marginTop: "20px",
+                }}
+              >
                 <div
                   style={{
                     padding: "18px",
+
                     border: "1px solid #dedede",
+
                     borderRadius: "12px",
+
                     background: "#fafafa",
                   }}
                 >
-                  <div
-                    style={{
-                      fontWeight: "650",
-                      marginBottom: "10px",
-                    }}
-                  >
-                    Search Shopify Products
-                  </div>
+                  <strong>Search Shopify Products</strong>
 
                   <Form method="get">
-                    <input type="hidden" name="uploadId" value={upload.id} />
+                    <input
+                      type="hidden"
+
+                      name="uploadId"
+
+                      value={upload.id}
+                    />
 
                     <div
                       style={{
+                        marginTop: "10px",
+
                         display: "flex",
+
                         gap: "8px",
-                        flexWrap: "wrap",
                       }}
                     >
                       <input
                         type="text"
+
                         name="search"
+
                         defaultValue={search}
+
                         placeholder="Search by product title..."
+
                         style={{
-                          flex: "1 1 280px",
-                          padding: "10px 12px",
+                          flex: "1",
+
+                          padding: "10px",
+
                           border: "1px solid #c9c9c9",
+
                           borderRadius: "8px",
-                          fontSize: "14px",
                         }}
                       />
 
-                      <s-button
+                      <button
                         type="submit"
-                        style={{
-                          padding: "10px 16px",
-                          borderRadius: "8px",
-                          border: "none",
-                          background: "#303030",
-                          color: "#ffffff",
-                          fontWeight: "650",
-                        }}
-                        icon="search"
+
+                        style={primaryButtonStyle}
                       >
                         Search
-                      </s-button>
+                      </button>
                     </div>
                   </Form>
 
@@ -507,10 +739,9 @@ export default function ProductSelection() {
                     <div
                       style={{
                         marginTop: "14px",
-                        color: "#616161",
                       }}
                     >
-                      No products found for “{search}”.
+                      No products found.
                     </div>
                   )}
 
@@ -518,211 +749,199 @@ export default function ProductSelection() {
                     <div
                       style={{
                         marginTop: "16px",
+
                         display: "flex",
+
                         flexDirection: "column",
+
                         gap: "8px",
                       }}
                     >
-                      {products.map((product) => (
-                        <Form method="post" key={product.id}>
-                          <input
-                            type="hidden"
-                            name="uploadId"
-                            value={upload.id}
-                          />
+                      {products.map((product) => {
+                        const selected = selectedProducts.has(product.handle);
 
-                          <input
-                            type="hidden"
-                            name="productHandle"
-                            value={product.handle}
-                          />
-
+                        return (
                           <div
+                            key={product.id}
                             style={{
-                              background: "#ffffff",
-                              border: "1px solid #e3e3e3",
-                              borderRadius: "10px",
-                              padding: "13px 14px",
+                              padding: "13px",
                               display: "flex",
-                              justifyContent: "space-between",
                               alignItems: "center",
-                              gap: "14px",
+                              gap: "12px",
+                              borderRadius: "10px",
+                              border: selected
+                                ? "1px solid #303030"
+                                : "1px solid #e3e3e3",
+                              background: selected ? "#f4f7ff" : "#ffffff",
                             }}
                           >
+                            <input
+                              type="checkbox"
+                              checked={selected}
+                              onChange={() => toggleProduct(product)}
+                              aria-label={`Select ${product.title}`}
+                            />
+
                             <div>
-                              <div
-                                style={{
-                                  fontWeight: "650",
-                                  marginBottom: "3px",
-                                }}
-                              >
-                                {product.title}
-                              </div>
+                              <strong>{product.title}</strong>
 
                               <div
                                 style={{
-                                  color: "#616161",
                                   fontSize: "13px",
+                                  color: "#616161",
+                                  marginTop: "3px",
                                 }}
                               >
-                                {product.handle}
-                                {" · "}
-                                {product.status}
+                                {product.handle} · {product.status}
                               </div>
                             </div>
-
-                            <button
-                              type="submit"
-                              name="mode"
-                              value="select"
-                              disabled={isSubmitting}
-                              style={{
-                                padding: "8px 14px",
-                                borderRadius: "8px",
-                                border: "1px solid #c9c9c9",
-                                background: "#ffffff",
-                                fontWeight: "600",
-                                cursor: "pointer",
-                              }}
-                            >
-                              Select
-                            </button>
                           </div>
-                        </Form>
-                      ))}
+                        );
+                      })}
                     </div>
                   )}
                 </div>
 
-                {/* Manual handle */}
-                <div style={{ marginTop: "18px" }}>
+                {/* =========================================
+                    SAVE ALL SELECTED PRODUCTS
+                ========================================= */}
+
+                <Form method="post">
+                  <input
+                    type="hidden"
+
+                    name="uploadId"
+
+                    value={upload.id}
+                  />
+
+                  <input
+                    type="hidden"
+
+                    name="mode"
+
+                    value="select"
+                  />
+
+                  {selectedProductList.map((product) => (
+                    <input
+                      key={product.handle}
+
+                      type="hidden"
+
+                      name="selectedProducts"
+
+                      value={JSON.stringify(product)}
+                    />
+                  ))}
+
                   <div
                     style={{
-                      fontWeight: "650",
-                      marginBottom: "8px",
+                      marginTop: "16px",
+
+                      display: "flex",
+
+                      justifyContent: "space-between",
+
+                      alignItems: "center",
                     }}
                   >
-                    Or enter handle manually
-                  </div>
-
-                  <Form method="post">
-                    <input type="hidden" name="uploadId" value={upload.id} />
-
-                    <div
-                      style={{
-                        display: "flex",
-                        gap: "8px",
-                        flexWrap: "wrap",
-                      }}
-                    >
-                      <input
-                        type="text"
-                        name="productHandle"
-                        defaultValue={upload.sourceProductHandle || ""}
-                        placeholder="triquilt-seat-covers"
-                        style={{
-                          flex: "1 1 280px",
-                          padding: "10px 12px",
-                          border: "1px solid #c9c9c9",
-                          borderRadius: "8px",
-                        }}
-                      />
-
-                      <button
-                        type="submit"
-                        name="mode"
-                        value="select"
-                        disabled={isSubmitting}
-                        style={{
-                          padding: "10px 16px",
-                          borderRadius: "8px",
-                          border: "none",
-                          background: "#303030",
-                          color: "#ffffff",
-                          fontWeight: "650",
-                        }}
-                      >
-                        Confirm Product
-                      </button>
+                    <div>
+                      {selectedProductList.length} product
+                      {selectedProductList.length === 1 ? "" : "s"} selected
                     </div>
-                  </Form>
-
-                  <div
-                    style={{
-                      marginTop: "7px",
-                      color: "#777",
-                      fontSize: "12px",
-                    }}
-                  >
-                    Use lowercase letters, numbers and hyphens only.
-                  </div>
-                </div>
-
-                <div style={{ marginTop: "18px" }}>
-                  <Form method="post">
-                    <input type="hidden" name="uploadId" value={upload.id} />
 
                     <button
                       type="submit"
-                      name="mode"
-                      value="skip"
-                      disabled={isSubmitting}
-                      style={{
-                        padding: "9px 14px",
-                        borderRadius: "8px",
-                        border: "1px solid #c9c9c9",
-                        background: "#ffffff",
-                      }}
+
+                      disabled={
+                        isSubmitting || selectedProductList.length === 0
+                      }
+
+                      style={primaryButtonStyle}
                     >
-                      Skip — No Product Suffix
+                      {isSubmitting ? "Saving..." : "Save Selected Products"}
                     </button>
-                  </Form>
-                </div>
+                  </div>
+                </Form>
               </div>
             )}
+
+            {/* =============================================
+                ERROR
+            ============================================= */}
 
             {actionData?.error && (
               <div
                 style={{
                   marginTop: "18px",
-                  border: "1px solid #f1b8b8",
-                  background: "#fff4f4",
-                  borderRadius: "10px",
+
                   padding: "14px",
+
+                  background: "#fff4f4",
+
+                  border: "1px solid #f1b8b8",
+
+                  borderRadius: "10px",
                 }}
               >
                 {actionData.error}
               </div>
             )}
 
+            {/* =============================================
+                SUCCESS / CONTINUE
+            ============================================= */}
+
             {actionData?.success && (
               <div
                 style={{
                   marginTop: "18px",
-                  border: "1px solid #b7ddb9",
-                  background: "#f1fff2",
-                  borderRadius: "10px",
+
                   padding: "14px",
+
+                  background: "#f1fff2",
+
+                  border: "1px solid #b7ddb9",
+
+                  borderRadius: "10px",
                 }}
               >
-                <div style={{ fontWeight: "650" }}>
-                  {actionData.productHandle
-                    ? `Selected product: ${actionData.productHandle}`
-                    : "No product suffix selected."}
-                </div>
+                <strong>
+                  {actionData.skipped
+                    ? "No product suffix selected."
+                    : `${actionData.products?.length || 0} products selected.`}
+                </strong>
 
-                <div style={{ marginTop: "12px" }}>
+                {!actionData.skipped && actionData.products?.length > 0 && (
+                  <div
+                    style={{
+                      marginTop: "8px",
+                    }}
+                  >
+                    {actionData.products
+                      .map((product) => product.handle)
+                      .join(", ")}
+                  </div>
+                )}
+
+                <div
+                  style={{
+                    marginTop: "12px",
+                  }}
+                >
                   <Link
                     to={`/app/filter?uploadId=${encodeURIComponent(
                       actionData.uploadId,
                     )}`}
+
                     style={{
                       display: "inline-block",
-                      padding: "10px 16px",
-                      borderRadius: "8px",
                       background: "#303030",
                       color: "#ffffff",
                       textDecoration: "none",
+                      padding: "11px 18px",
+                      borderRadius: "8px",
                       fontWeight: "650",
                     }}
                   >
@@ -733,116 +952,54 @@ export default function ProductSelection() {
             )}
           </s-section>
 
-          {/* Right-side explanation */}
+          {/* =================================================
+              EXPLANATION
+          ================================================= */}
+
           <div
             style={{
               background: "#ffffff",
+
               border: "1px solid #e3e3e3",
+
               borderRadius: "12px",
+
               padding: "20px",
             }}
           >
-            <div
-              style={{
-                fontSize: "17px",
-                fontWeight: "650",
-                marginBottom: "10px",
-              }}
-            >
-              How Handles Work
-            </div>
+            <strong>How Multiple Products Work</strong>
+
+            <p>
+              One vehicle will generate one page for every selected product.
+            </p>
 
             <div
               style={{
-                color: "#616161",
-                lineHeight: "1.55",
-                fontSize: "14px",
-              }}
-            >
-              The selected product handle is appended to each generated vehicle
-              page URL.
-            </div>
-
-            <div
-              style={{
-                marginTop: "18px",
                 padding: "12px",
+
                 background: "#f6f6f7",
+
                 borderRadius: "8px",
               }}
             >
-              <div
-                style={{
-                  fontSize: "12px",
-                  color: "#777",
-                  marginBottom: "5px",
-                }}
-              >
-                WITH PRODUCT HANDLE
-              </div>
-
-              <code
-                style={{
-                  fontSize: "12px",
-                  wordBreak: "break-word",
-                }}
-              >
+              <code>
                 2027-toyota-land-cruiser-base-triquilt-seat-covers
+                <br />
+                2027-toyota-land-cruiser-base-luxiline-seat-cover
+                <br />
+                2027-toyota-land-cruiser-base-silverstone-seat-cover
               </code>
             </div>
 
-            <div
-              style={{
-                marginTop: "10px",
-                padding: "12px",
-                background: "#f6f6f7",
-                borderRadius: "8px",
-              }}
-            >
-              <div
-                style={{
-                  fontSize: "12px",
-                  color: "#777",
-                  marginBottom: "5px",
-                }}
-              >
-                WITHOUT PRODUCT SUFFIX
-              </div>
-
-              <code
-                style={{
-                  fontSize: "12px",
-                  wordBreak: "break-word",
-                }}
-              >
-                2027-toyota-land-cruiser-base
-              </code>
-            </div>
-
-            <div
-              style={{
-                marginTop: "18px",
-                fontSize: "13px",
-                color: "#616161",
-              }}
-            >
-              The selected source handle is saved with this upload and used when
-              proposed page handles are generated during Filter and Review.
-            </div>
+            <p>
+              The products above are only examples. The app does not limit
+              selection to any specific product.
+            </p>
           </div>
         </div>
 
         <div>
-          <Link
-            to="/app/upload"
-            style={{
-              color: "#616161",
-              textDecoration: "none",
-              fontWeight: "600",
-            }}
-          >
-            ← Back to Upload
-          </Link>
+          <Link to="/app/upload">← Back to Upload</Link>
         </div>
       </div>
     </s-page>

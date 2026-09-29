@@ -702,3 +702,73 @@ export async function searchYMMTPagesByRecords(admin, records) {
     missingRecords,
   };
 }
+
+export async function recreateShopifyPageFromSnapshot(admin, snapshot) {
+  if (!snapshot) {
+    throw new Error("Missing page snapshot.");
+  }
+
+  const metafields =
+    snapshot.metafields?.nodes?.map((metafield) => ({
+      namespace: metafield.namespace,
+      key: metafield.key,
+      type: metafield.type,
+      value: metafield.value,
+    })) || [];
+
+  const page = {
+    title: snapshot.title,
+    handle: snapshot.handle,
+    body: snapshot.body || "",
+    templateSuffix: snapshot.templateSuffix || "",
+    isPublished: Boolean(snapshot.isPublished),
+  };
+
+  if (metafields.length > 0) {
+    page.metafields = metafields;
+  }
+
+  const response = await admin.graphql(
+    `#graphql
+      mutation RecreateDeletedPage($page: PageCreateInput!) {
+        pageCreate(page: $page) {
+          page {
+            id
+            title
+            handle
+            templateSuffix
+            isPublished
+          }
+
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `,
+    {
+      variables: {
+        page,
+      },
+    },
+  );
+
+  const json = await response.json();
+
+  if (json.errors?.length) {
+    throw new Error(json.errors.map((error) => error.message).join(", "));
+  }
+
+  const result = json.data?.pageCreate;
+
+  if (result?.userErrors?.length) {
+    throw new Error(result.userErrors.map((error) => error.message).join(", "));
+  }
+
+  if (!result?.page) {
+    throw new Error("Shopify did not return the recreated page.");
+  }
+
+  return result.page;
+}

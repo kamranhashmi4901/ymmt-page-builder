@@ -46,6 +46,67 @@ export async function getYMMTUpload({ uploadId, shop }) {
       id: uploadId,
       shop,
     },
+    include: {
+      sourceProducts: {
+        orderBy: {
+          createdAt: "asc",
+        },
+      },
+    },
+  });
+}
+export async function setSourceProducts({ uploadId, shop, products }) {
+  const upload = await db.ymmtUpload.findFirst({
+    where: {
+      id: uploadId,
+      shop,
+    },
+    select: {
+      id: true,
+    },
+  });
+
+  if (!upload) {
+    throw new Error("YMMT upload not found.");
+  }
+
+  return db.$transaction(async (tx) => {
+    /*
+     * Replace the current product selection for this upload.
+     *
+     * This means the user can:
+     * - select 1 product
+     * - later change to 2 products
+     * - later change to 3 products
+     *
+     * without leaving old selections behind.
+     */
+    await tx.ymmtUploadProduct.deleteMany({
+      where: {
+        uploadId,
+      },
+    });
+
+    if (products.length > 0) {
+      await tx.ymmtUploadProduct.createMany({
+        data: products.map((product) => ({
+          uploadId,
+          productId: product.productId || null,
+          title: product.title || null,
+          handle: product.handle,
+        })),
+      });
+    }
+
+    return tx.ymmtUpload.findUnique({
+      where: {
+        id: uploadId,
+      },
+
+      include: {
+        sourceProducts: true,
+      },
+    });
   });
 }
 
@@ -67,13 +128,29 @@ export async function setSourceProductHandle({
 
 export async function getYMMTFilterOptions({ uploadId, shop }) {
   const upload = await db.ymmtUpload.findFirst({
-    where: { id: uploadId, shop },
+    where: {
+      id: uploadId,
+      shop,
+    },
+
+    include: {
+      sourceProducts: {
+        orderBy: {
+          createdAt: "asc",
+        },
+      },
+    },
   });
 
-  if (!upload) return null;
+  if (!upload) {
+    return null;
+  }
 
   const records = await db.ymmtRecord.findMany({
-    where: { uploadId },
+    where: {
+      uploadId,
+    },
+
     select: {
       year: true,
       make: true,
@@ -85,18 +162,23 @@ export async function getYMMTFilterOptions({ uploadId, shop }) {
 
   return {
     upload,
-    years: [...new Set(records.map((r) => r.year))].sort(),
-    makes: [...new Set(records.map((r) => r.make))].sort(),
-    models: [...new Set(records.map((r) => r.model))].sort(),
+
+    years: [...new Set(records.map((record) => record.year))].sort(),
+
+    makes: [...new Set(records.map((record) => record.make))].sort(),
+
+    models: [...new Set(records.map((record) => record.model))].sort(),
+
     trims: [
       ...new Set(
         records
-          .map((r) => r.trim)
+          .map((record) => record.trim)
           .filter((trim) => trim && trim.toLowerCase() !== "all"),
       ),
     ].sort(),
+
     manufacturers: [
-      ...new Set(records.map((r) => r.manufacturer).filter(Boolean)),
+      ...new Set(records.map((record) => record.manufacturer).filter(Boolean)),
     ].sort(),
   };
 }

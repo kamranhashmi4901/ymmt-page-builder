@@ -3,27 +3,22 @@ import db from "../db.server";
 import { buildYMMTPageHandle, buildYMMTPageTitle } from "./ymmt-pages";
 
 import { createYMMTPage } from "./shopify-page-create.server";
+
 import { getExistingPageHandles } from "./shopify-pages.server";
 
 const activeJobs = new Set();
 
 /*
- * Return the selected products for this upload.
- *
- * If no product was selected, keep the old behavior:
- * create one page without a product suffix.
+ * Return selected products.
  */
 function getSourceProducts(upload) {
   return upload.sourceProducts?.length > 0 ? upload.sourceProducts : [null];
 }
 
 /*
- * Build one page proposal for every combination:
+ * Build one page proposal for every:
  *
- * YMMT record × selected product
- *
- * Example:
- * 1 vehicle × 3 products = 3 page proposals
+ * vehicle × product
  */
 function buildPageProposals(record, upload) {
   return getSourceProducts(upload).map((product) => {
@@ -41,18 +36,15 @@ function buildPageProposals(record, upload) {
   });
 }
 
-/*
- * Create a new background creation job.
- *
- * IMPORTANT:
- * total now means the real number of Shopify pages:
- *
- * selected vehicles × selected products
- */
+/* =========================================================
+   CREATE JOB
+========================================================= */
+
 export async function createYMMTJob({ shop, uploadId }) {
   const upload = await db.ymmtUpload.findFirst({
     where: {
       id: uploadId,
+
       shop,
     },
 
@@ -72,7 +64,9 @@ export async function createYMMTJob({ shop, uploadId }) {
   const records = await db.ymmtRecord.findMany({
     where: {
       uploadId,
+
       selected: true,
+
       duplicate: false,
     },
 
@@ -93,20 +87,25 @@ export async function createYMMTJob({ shop, uploadId }) {
     data: {
       shop,
       uploadId,
+
       type: "create",
+
       status: "pending",
+
       total,
     },
   });
 }
 
-/*
- * Read a job together with the latest logs.
- */
+/* =========================================================
+   GET JOB
+========================================================= */
+
 export async function getYMMTJob({ jobId, shop }) {
   return db.ymmtJob.findFirst({
     where: {
       id: jobId,
+
       shop,
     },
 
@@ -122,9 +121,10 @@ export async function getYMMTJob({ jobId, shop }) {
   });
 }
 
-/*
- * Small helper used throughout the processor.
- */
+/* =========================================================
+   LOG HELPER
+========================================================= */
+
 async function logJob({
   jobId,
   level = "info",
@@ -143,14 +143,17 @@ async function logJob({
   });
 }
 
-/*
- * Pause the job.
- */
+/* =========================================================
+   PAUSE
+========================================================= */
+
 export async function pauseYMMTJob({ jobId, shop }) {
   return db.ymmtJob.updateMany({
     where: {
       id: jobId,
+
       shop,
+
       status: "running",
     },
 
@@ -160,14 +163,17 @@ export async function pauseYMMTJob({ jobId, shop }) {
   });
 }
 
-/*
- * Resume the job.
- */
+/* =========================================================
+   RESUME
+========================================================= */
+
 export async function resumeYMMTJob({ jobId, shop, admin }) {
   await db.ymmtJob.updateMany({
     where: {
       id: jobId,
+
       shop,
+
       status: "paused",
     },
 
@@ -183,13 +189,15 @@ export async function resumeYMMTJob({ jobId, shop, admin }) {
   });
 }
 
-/*
- * Cancel the job.
- */
+/* =========================================================
+   CANCEL
+========================================================= */
+
 export async function cancelYMMTJob({ jobId, shop }) {
   await db.ymmtJob.updateMany({
     where: {
       id: jobId,
+
       shop,
 
       status: {
@@ -199,21 +207,24 @@ export async function cancelYMMTJob({ jobId, shop }) {
 
     data: {
       status: "cancelled",
+
       finishedAt: new Date(),
     },
   });
 
   await logJob({
     jobId,
+
     level: "warning",
+
     message: "Job cancelled by user.",
   });
 }
 
-/*
- * Prevent the same job from running more than once
- * inside the current Node process.
- */
+/* =========================================================
+   START PROCESSOR
+========================================================= */
+
 export function startYMMTJobProcessor({ jobId, shop, admin }) {
   if (activeJobs.has(jobId)) {
     return;
@@ -230,12 +241,6 @@ export function startYMMTJobProcessor({ jobId, shop, admin }) {
   });
 }
 
-/*
- * Read only the current job status.
- *
- * We check this before every individual page so pause/cancel
- * reacts even while one vehicle has multiple products.
- */
 async function getCurrentJobStatus(jobId) {
   return db.ymmtJob.findUnique({
     where: {
@@ -248,14 +253,16 @@ async function getCurrentJobStatus(jobId) {
   });
 }
 
-/*
- * Main creation processor.
- */
+/* =========================================================
+   MAIN PROCESSOR
+========================================================= */
+
 async function processJob({ jobId, shop, admin }) {
   try {
     const job = await db.ymmtJob.findFirst({
       where: {
         id: jobId,
+
         shop,
       },
     });
@@ -264,16 +271,10 @@ async function processJob({ jobId, shop, admin }) {
       return;
     }
 
-    /*
-     * IMPORTANT:
-     * We must include sourceProducts here.
-     *
-     * Without this, the processor would fall back
-     * to the old single-product behavior.
-     */
     const upload = await db.ymmtUpload.findFirst({
       where: {
         id: job.uploadId,
+
         shop,
       },
 
@@ -295,7 +296,9 @@ async function processJob({ jobId, shop, admin }) {
     const records = await db.ymmtRecord.findMany({
       where: {
         uploadId: job.uploadId,
+
         selected: true,
+
         duplicate: false,
       },
 
@@ -308,12 +311,6 @@ async function processJob({ jobId, shop, admin }) {
       throw new Error("No selected records available.");
     }
 
-    /*
-     * Recalculate total at processor start.
-     *
-     * Example:
-     * 10 vehicles × 3 products = 30 pages
-     */
     const expectedTotal = records.length * sourceProducts.length;
 
     await db.ymmtJob.update({
@@ -341,26 +338,33 @@ async function processJob({ jobId, shop, admin }) {
     });
 
     /*
-     * Existing Shopify handles.
+     * IMPORTANT:
      *
-     * New handles created during this job are also added
-     * to this Set so we never create duplicates in the
-     * same job.
+     * OLD:
+     * getExistingPageHandles(admin)
+     *
+     * That scanned the entire Shopify store.
+     *
+     * NEW:
+     * Build only the handles this job is
+     * actually going to create.
      */
-    const existingHandles = await getExistingPageHandles(admin);
+    const candidateHandles = records.flatMap((record) =>
+      buildPageProposals(record, upload).map((proposal) => proposal.handle),
+    );
+
+    const existingHandles = await getExistingPageHandles(
+      admin,
+      candidateHandles,
+    );
 
     /*
      * Resume safety.
      *
-     * OLD VERSION:
-     * processed by recordId only.
-     *
-     * That does NOT work with multiple products because:
-     *
-     * record A + product 1 may be completed
-     * record A + product 2 may still be pending
-     *
-     * Therefore we track processed combinations by HANDLE.
+     * Track already completed
+     * combinations by handle because
+     * one vehicle can have multiple
+     * product pages.
      */
     const processedLogs = await db.ymmtJobLog.findMany({
       where: {
@@ -388,9 +392,6 @@ async function processJob({ jobId, shop, admin }) {
      * Vehicle loop.
      */
     for (const record of records) {
-      /*
-       * Build every selected product page for this vehicle.
-       */
       const proposals = buildPageProposals(record, upload);
 
       /*
@@ -400,35 +401,26 @@ async function processJob({ jobId, shop, admin }) {
         const { sourceProductHandle, handle, title } = proposal;
 
         /*
-         * If this exact page was already completed by
-         * this same job before pause/resume, skip it.
+         * Already processed by this job.
          */
         if (processedHandles.has(handle)) {
           continue;
         }
 
-        /*
-         * Check current job status before each page.
-         */
         const currentJob = await getCurrentJobStatus(jobId);
 
         if (!currentJob) {
           return;
         }
 
-        /*
-         * Stop immediately if user cancelled.
-         */
         if (currentJob.status === "cancelled") {
           return;
         }
 
-        /*
-         * Stop safely if user paused.
-         */
         if (currentJob.status === "paused") {
           await logJob({
             jobId,
+
             message: "Job paused.",
           });
 
@@ -436,8 +428,8 @@ async function processJob({ jobId, shop, admin }) {
         }
 
         /*
-         * If page already exists in Shopify,
-         * mark this combination as skipped.
+         * Existing page found by targeted
+         * lookup.
          */
         if (existingHandles.has(handle)) {
           await db.$transaction([
@@ -480,32 +472,25 @@ async function processJob({ jobId, shop, admin }) {
         }
 
         /*
-         * Create the actual Shopify page.
+         * Create page.
          */
         try {
           await createYMMTPage(admin, {
             title,
             handle,
             record,
-
-            /*
-             * This is the important part:
-             * every page receives its own selected product handle.
-             */
             sourceProductHandle,
           });
 
           /*
-           * Add newly-created handle immediately so another
-           * combination in this same job cannot recreate it.
+           * Immediately add new handle
+           * to in-memory sets so this job
+           * can never create it twice.
            */
           existingHandles.add(handle);
 
           processedHandles.add(handle);
 
-          /*
-           * Mark success.
-           */
           await db.$transaction([
             db.ymmtJob.update({
               where: {
@@ -542,9 +527,7 @@ async function processJob({ jobId, shop, admin }) {
         } catch (error) {
           /*
            * One page failed.
-           *
-           * We do NOT fail the whole job.
-           * Continue to the next product/page.
+           * Continue with remaining pages.
            */
           await db.$transaction([
             db.ymmtJob.update({
@@ -581,19 +564,12 @@ async function processJob({ jobId, shop, admin }) {
       }
     }
 
-    /*
-     * Everything has finished.
-     */
     const finishedJob = await db.ymmtJob.findUnique({
       where: {
         id: jobId,
       },
     });
 
-    /*
-     * Only mark completed when the user did not
-     * pause or cancel the job.
-     */
     if (finishedJob && finishedJob.status === "running") {
       await db.ymmtJob.update({
         where: {
@@ -602,20 +578,18 @@ async function processJob({ jobId, shop, admin }) {
 
         data: {
           status: "completed",
+
           finishedAt: new Date(),
         },
       });
 
       await logJob({
         jobId,
+
         message: "Creation job completed.",
       });
     }
   } catch (error) {
-    /*
-     * Read status first so an explicitly cancelled
-     * job is not accidentally changed to failed.
-     */
     const currentJob = await db.ymmtJob.findUnique({
       where: {
         id: jobId,
@@ -634,6 +608,7 @@ async function processJob({ jobId, shop, admin }) {
 
         data: {
           status: "failed",
+
           finishedAt: new Date(),
         },
       });

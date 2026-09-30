@@ -11,8 +11,11 @@ import db from "../db.server";
 import { createYMMTJob, startYMMTJobProcessor } from "../lib/ymmt-jobs.server";
 
 import { authenticate } from "../shopify.server";
+
 import { getYMMTUpload } from "../lib/ymmt-uploads.server";
+
 import { getExistingPageHandles } from "../lib/shopify-pages.server";
+
 import { buildYMMTPageHandle } from "../lib/ymmt-pages";
 
 function buildRecordHandles(record, upload) {
@@ -28,6 +31,7 @@ export const loader = async ({ request }) => {
   const { session, admin } = await authenticate.admin(request);
 
   const url = new URL(request.url);
+
   const uploadId = url.searchParams.get("uploadId");
 
   if (!uploadId) {
@@ -38,6 +42,7 @@ export const loader = async ({ request }) => {
 
   const upload = await getYMMTUpload({
     uploadId,
+
     shop: session.shop,
   });
 
@@ -50,14 +55,30 @@ export const loader = async ({ request }) => {
   const selectedRecords = await db.ymmtRecord.findMany({
     where: {
       uploadId,
+
       selected: true,
+
       duplicate: false,
     },
   });
 
-  const existingHandles = await getExistingPageHandles(admin);
+  /*
+   * Build only the final Shopify handles
+   * that this creation batch needs.
+   */
+  const candidateHandles = selectedRecords.flatMap((record) =>
+    buildRecordHandles(record, upload),
+  );
+
+  /*
+   * Targeted duplicate lookup.
+   *
+   * No full-store page scan.
+   */
+  const existingHandles = await getExistingPageHandles(admin, candidateHandles);
 
   let pageCount = 0;
+
   let skippedExistingCount = 0;
 
   for (const record of selectedRecords) {
@@ -74,9 +95,13 @@ export const loader = async ({ request }) => {
 
   return {
     upload,
+
     selectedCount: selectedRecords.length,
+
     pageCount,
+
     skippedExistingCount,
+
     productCount:
       upload.sourceProducts?.length > 0 ? upload.sourceProducts.length : 1,
   };
@@ -91,6 +116,7 @@ export const action = async ({ request }) => {
 
   const upload = await getYMMTUpload({
     uploadId,
+
     shop: session.shop,
   });
 
@@ -102,12 +128,15 @@ export const action = async ({ request }) => {
 
   const job = await createYMMTJob({
     shop: session.shop,
+
     uploadId,
   });
 
   startYMMTJobProcessor({
     jobId: job.id,
+
     shop: session.shop,
+
     admin,
   });
 
@@ -123,17 +152,39 @@ import {
 } from "@shopify/polaris-icons";
 
 const steps = [
-  { label: "Upload Data", icon: UploadIcon },
-  { label: "Select Products", icon: ProductIcon },
-  { label: "Filter & Preview", icon: FilterIcon },
-  { label: "Review & Select", icon: CheckCircleIcon },
-  { label: "Create Pages", icon: PageAddIcon },
+  {
+    label: "Upload Data",
+    icon: UploadIcon,
+  },
+
+  {
+    label: "Select Products",
+    icon: ProductIcon,
+  },
+
+  {
+    label: "Filter & Preview",
+    icon: FilterIcon,
+  },
+
+  {
+    label: "Review & Select",
+    icon: CheckCircleIcon,
+  },
+
+  {
+    label: "Create Pages",
+    icon: PageAddIcon,
+  },
 ];
 
 const summaryCardStyle = {
   background: "#ffffff",
+
   border: "1px solid #e3e3e3",
+
   borderRadius: "12px",
+
   padding: "16px",
 };
 
@@ -155,52 +206,73 @@ export default function CreatePages() {
       <div
         style={{
           display: "flex",
+
           flexDirection: "column",
+
           gap: "24px",
         }}
       >
         <div
           style={{
             display: "flex",
+
             alignItems: "center",
+
             gap: "8px",
+
             flexWrap: "wrap",
           }}
         >
           {steps.map((step, index) => {
             const Icon = step.icon;
+
             const isActive = index === 4;
 
             return (
               <div
                 key={step.label}
+
                 style={{
                   display: "flex",
+
                   alignItems: "center",
+
                   gap: "8px",
                 }}
               >
                 <div
                   style={{
                     width: "160px",
+
                     height: "40px",
+
                     display: "flex",
+
                     alignItems: "center",
+
                     justifyContent: "center",
+
                     gap: "7px",
+
                     borderRadius: "9px",
+
                     border: isActive
                       ? "1px solid #303030"
                       : "1px solid #d8d8d8",
+
                     background: isActive ? "#303030" : "#ffffff",
+
                     color: isActive ? "#ffffff" : "#616161",
                   }}
                 >
                   <span
                     style={{
                       width: "16px",
+
                       height: "16px",
+
                       display: "inline-flex",
+
                       fill: isActive ? "#ffffff" : "#616161",
                     }}
                   >
@@ -228,7 +300,9 @@ export default function CreatePages() {
         <div
           style={{
             display: "grid",
+
             gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+
             gap: "12px",
           }}
         >
@@ -236,13 +310,22 @@ export default function CreatePages() {
             <div
               style={{
                 color: "#616161",
+
                 fontSize: "13px",
+
                 marginBottom: "5px",
               }}
             >
               Selected Vehicles
             </div>
-            <div style={{ fontSize: "28px", fontWeight: "700" }}>
+
+            <div
+              style={{
+                fontSize: "28px",
+
+                fontWeight: "700",
+              }}
+            >
               {selectedCount}
             </div>
           </div>
@@ -251,13 +334,22 @@ export default function CreatePages() {
             <div
               style={{
                 color: "#616161",
+
                 fontSize: "13px",
+
                 marginBottom: "5px",
               }}
             >
               Selected Products
             </div>
-            <div style={{ fontSize: "28px", fontWeight: "700" }}>
+
+            <div
+              style={{
+                fontSize: "28px",
+
+                fontWeight: "700",
+              }}
+            >
               {productCount}
             </div>
           </div>
@@ -266,13 +358,22 @@ export default function CreatePages() {
             <div
               style={{
                 color: "#616161",
+
                 fontSize: "13px",
+
                 marginBottom: "5px",
               }}
             >
               New Pages to Create
             </div>
-            <div style={{ fontSize: "28px", fontWeight: "700" }}>
+
+            <div
+              style={{
+                fontSize: "28px",
+
+                fontWeight: "700",
+              }}
+            >
               {pageCount}
             </div>
           </div>
@@ -281,13 +382,22 @@ export default function CreatePages() {
             <div
               style={{
                 color: "#616161",
+
                 fontSize: "13px",
+
                 marginBottom: "5px",
               }}
             >
               Existing Pages Skipped
             </div>
-            <div style={{ fontSize: "28px", fontWeight: "700" }}>
+
+            <div
+              style={{
+                fontSize: "28px",
+
+                fontWeight: "700",
+              }}
+            >
               {skippedExistingCount}
             </div>
           </div>
@@ -296,16 +406,21 @@ export default function CreatePages() {
             <div
               style={{
                 color: "#616161",
+
                 fontSize: "13px",
+
                 marginBottom: "5px",
               }}
             >
               Source File
             </div>
+
             <div
               style={{
                 marginTop: "7px",
+
                 fontWeight: "650",
+
                 wordBreak: "break-word",
               }}
             >
@@ -320,8 +435,11 @@ export default function CreatePages() {
           <div
             style={{
               marginTop: "10px",
+
               display: "flex",
+
               flexWrap: "wrap",
+
               gap: "8px",
             }}
           >
@@ -329,12 +447,18 @@ export default function CreatePages() {
               upload.sourceProducts.map((product) => (
                 <span
                   key={product.id}
+
                   style={{
                     padding: "7px 10px",
+
                     border: "1px solid #d8d8d8",
+
                     borderRadius: "999px",
+
                     background: "#f6f6f7",
+
                     fontSize: "12px",
+
                     fontWeight: "600",
                   }}
                 >
@@ -350,8 +474,11 @@ export default function CreatePages() {
         <div
           style={{
             border: "1px solid #e6cf8b",
+
             background: "#fff8e6",
+
             borderRadius: "12px",
+
             padding: "16px",
           }}
         >
@@ -360,8 +487,11 @@ export default function CreatePages() {
           <div
             style={{
               marginTop: "6px",
+
               color: "#616161",
+
               lineHeight: "1.5",
+
               fontSize: "14px",
             }}
           >
@@ -374,8 +504,11 @@ export default function CreatePages() {
         <div
           style={{
             display: "flex",
+
             justifyContent: "space-between",
+
             alignItems: "center",
+
             gap: "12px",
           }}
         >
@@ -384,17 +517,30 @@ export default function CreatePages() {
           </Link>
 
           <Form method="post">
-            <input type="hidden" name="uploadId" value={upload.id} />
+            <input
+              type="hidden"
+
+              name="uploadId"
+
+              value={upload.id}
+            />
 
             <button
               type="submit"
+
               disabled={isCreating || selectedCount === 0 || pageCount === 0}
+
               style={{
                 padding: "9px 14px",
+
                 borderRadius: "8px",
+
                 border: "1px solid #c9c9c9",
+
                 background: "#ffffff",
+
                 fontWeight: "650",
+
                 cursor: "pointer",
               }}
             >

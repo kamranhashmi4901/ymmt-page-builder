@@ -24,9 +24,13 @@ import { buildYMMTPageHandle, buildYMMTPageTitle } from "../lib/ymmt-pages";
 function getFiltersFromURL(url) {
   return {
     year: url.searchParams.get("year") || "",
+
     make: url.searchParams.get("make") || "",
+
     model: url.searchParams.get("model") || "",
+
     trim: url.searchParams.get("trim") || "",
+
     manufacturer: url.searchParams.get("manufacturer") || "",
   };
 }
@@ -34,9 +38,13 @@ function getFiltersFromURL(url) {
 function getFiltersFromForm(formData) {
   return {
     year: String(formData.get("year") || ""),
+
     make: String(formData.get("make") || ""),
+
     model: String(formData.get("model") || ""),
+
     trim: String(formData.get("trim") || ""),
+
     manufacturer: String(formData.get("manufacturer") || ""),
   };
 }
@@ -46,10 +54,22 @@ function buildReviewURL({ uploadId, filters, page = 1 }) {
 
   params.set("uploadId", uploadId);
 
-  if (filters.year) params.set("year", filters.year);
-  if (filters.make) params.set("make", filters.make);
-  if (filters.model) params.set("model", filters.model);
-  if (filters.trim) params.set("trim", filters.trim);
+  if (filters.year) {
+    params.set("year", filters.year);
+  }
+
+  if (filters.make) {
+    params.set("make", filters.make);
+  }
+
+  if (filters.model) {
+    params.set("model", filters.model);
+  }
+
+  if (filters.trim) {
+    params.set("trim", filters.trim);
+  }
+
   if (filters.manufacturer) {
     params.set("manufacturer", filters.manufacturer);
   }
@@ -70,12 +90,32 @@ function buildRecordProposals(record, upload, existingHandles) {
 
     return {
       productId: product?.productId || null,
+
       productTitle: product?.title || null,
+
       sourceProductHandle,
+
       proposedTitle: buildYMMTPageTitle(record, sourceProductHandle),
+
       proposedHandle,
+
       duplicate: existingHandles.has(proposedHandle),
     };
+  });
+}
+
+/*
+ * Build ONLY the Shopify handles that
+ * we need to check.
+ */
+function buildCandidateHandles(records, upload) {
+  return records.flatMap((record) => {
+    const sourceProducts =
+      upload.sourceProducts?.length > 0 ? upload.sourceProducts : [null];
+
+    return sourceProducts.map((product) =>
+      buildYMMTPageHandle(record, product?.handle || null),
+    );
   });
 }
 
@@ -86,20 +126,30 @@ async function saveCurrentPageSelection({
   upload,
   admin,
 }) {
-  if (!pageIds.length) return;
+  if (!pageIds.length) {
+    return;
+  }
 
   const records = await db.ymmtRecord.findMany({
     where: {
       uploadId,
+
       id: {
         in: pageIds,
       },
     },
   });
 
-  const existingHandles = await getExistingPageHandles(admin);
+  /*
+   * Check only handles belonging to
+   * records on this review page.
+   */
+  const candidateHandles = buildCandidateHandles(records, upload);
+
+  const existingHandles = await getExistingPageHandles(admin, candidateHandles);
 
   const duplicateIds = [];
+
   const selectableIds = [];
 
   for (const record of records) {
@@ -123,10 +173,12 @@ async function saveCurrentPageSelection({
     db.ymmtRecord.updateMany({
       where: {
         uploadId,
+
         id: {
           in: pageIds,
         },
       },
+
       data: {
         selected: false,
       },
@@ -138,10 +190,12 @@ async function saveCurrentPageSelection({
       db.ymmtRecord.updateMany({
         where: {
           uploadId,
+
           id: {
             in: selectableIds,
           },
         },
+
         data: {
           duplicate: false,
         },
@@ -154,10 +208,12 @@ async function saveCurrentPageSelection({
       db.ymmtRecord.updateMany({
         where: {
           uploadId,
+
           id: {
             in: duplicateIds,
           },
         },
+
         data: {
           duplicate: true,
           selected: false,
@@ -171,10 +227,12 @@ async function saveCurrentPageSelection({
       db.ymmtRecord.updateMany({
         where: {
           uploadId,
+
           id: {
             in: allowedSelectedIds,
           },
         },
+
         data: {
           selected: true,
         },
@@ -186,33 +244,52 @@ async function saveCurrentPageSelection({
 }
 
 async function selectAllMatchingRecords({ uploadId, upload, filters, admin }) {
-  const existingHandles = await getExistingPageHandles(admin);
-
+  /*
+   * Clear old selection first.
+   */
   await db.ymmtRecord.updateMany({
     where: {
       uploadId,
     },
+
     data: {
       selected: false,
     },
   });
 
+  /*
+   * Process matching records in chunks.
+   *
+   * Each batch checks only its own proposed
+   * Shopify handles.
+   */
   const batchSize = 1000;
 
   let currentPage = 1;
+
   let totalPages = 1;
 
   do {
     const result = await getFilteredYMMTRecords({
       uploadId,
       ...filters,
+
       page: currentPage,
+
       pageSize: batchSize,
     });
 
     totalPages = result.totalPages;
 
+    const candidateHandles = buildCandidateHandles(result.records, upload);
+
+    const existingHandles = await getExistingPageHandles(
+      admin,
+      candidateHandles,
+    );
+
     const duplicateIds = [];
+
     const selectableIds = [];
 
     for (const record of result.records) {
@@ -236,10 +313,12 @@ async function selectAllMatchingRecords({ uploadId, upload, filters, admin }) {
         db.ymmtRecord.updateMany({
           where: {
             uploadId,
+
             id: {
               in: duplicateIds,
             },
           },
+
           data: {
             duplicate: true,
             selected: false,
@@ -253,10 +332,12 @@ async function selectAllMatchingRecords({ uploadId, upload, filters, admin }) {
         db.ymmtRecord.updateMany({
           where: {
             uploadId,
+
             id: {
               in: selectableIds,
             },
           },
+
           data: {
             duplicate: false,
             selected: true,
@@ -273,10 +354,15 @@ async function selectAllMatchingRecords({ uploadId, upload, filters, admin }) {
   } while (currentPage <= totalPages);
 }
 
+/* =========================================================
+   LOADER
+========================================================= */
+
 export const loader = async ({ request }) => {
   const { session, admin } = await authenticate.admin(request);
 
   const url = new URL(request.url);
+
   const uploadId = url.searchParams.get("uploadId");
 
   if (!uploadId) {
@@ -287,6 +373,7 @@ export const loader = async ({ request }) => {
 
   const upload = await getYMMTUpload({
     uploadId,
+
     shop: session.shop,
   });
 
@@ -312,36 +399,51 @@ export const loader = async ({ request }) => {
     pageSize,
   });
 
-  const existingHandles = await getExistingPageHandles(admin);
+  /*
+   * Existing selected records are included
+   * because selectedPageCount also needs
+   * duplicate information.
+   */
+  const selectedRecords = await db.ymmtRecord.findMany({
+    where: {
+      uploadId,
+
+      selected: true,
+
+      duplicate: false,
+    },
+  });
+
+  /*
+   * Only check Shopify handles required by:
+   *
+   * - current visible review page
+   * - currently selected records
+   */
+  const candidateHandles = buildCandidateHandles(
+    [...result.records, ...selectedRecords],
+    upload,
+  );
+
+  const existingHandles = await getExistingPageHandles(admin, candidateHandles);
 
   const records = result.records.map((record) => {
     const proposals = buildRecordProposals(record, upload, existingHandles);
 
     return {
       ...record,
+
       proposals,
+
       duplicate:
         proposals.length > 0 &&
         proposals.every((proposal) => proposal.duplicate),
+
       newPageCount: proposals.filter((proposal) => !proposal.duplicate).length,
     };
   });
 
-  const selectedCount = await db.ymmtRecord.count({
-    where: {
-      uploadId,
-      selected: true,
-      duplicate: false,
-    },
-  });
-
-  const selectedRecords = await db.ymmtRecord.findMany({
-    where: {
-      uploadId,
-      selected: true,
-      duplicate: false,
-    },
-  });
+  const selectedCount = selectedRecords.length;
 
   let selectedPageCount = 0;
 
@@ -357,8 +459,11 @@ export const loader = async ({ request }) => {
     upload,
     filters,
     records,
+
     total: result.total,
+
     totalPages: result.totalPages,
+
     page,
     pageSize,
     selectedCount,
@@ -366,12 +471,17 @@ export const loader = async ({ request }) => {
   };
 };
 
+/* =========================================================
+   ACTION
+========================================================= */
+
 export const action = async ({ request }) => {
   const { session, admin } = await authenticate.admin(request);
 
   const formData = await request.formData();
 
   const intent = String(formData.get("intent") || "");
+
   const uploadId = String(formData.get("uploadId") || "");
 
   if (!uploadId) {
@@ -382,6 +492,7 @@ export const action = async ({ request }) => {
 
   const upload = await getYMMTUpload({
     uploadId,
+
     shop: session.shop,
   });
 
@@ -393,7 +504,11 @@ export const action = async ({ request }) => {
 
   const filters = getFiltersFromForm(formData);
 
-  const currentPage = Math.max(1, Number(formData.get("currentPage") || "1"));
+  const currentPage = Math.max(
+    1,
+
+    Number(formData.get("currentPage") || "1"),
+  );
 
   if (intent === "select-all-matching") {
     await selectAllMatchingRecords({
@@ -407,6 +522,7 @@ export const action = async ({ request }) => {
       buildReviewURL({
         uploadId,
         filters,
+
         page: currentPage,
       }),
     );
@@ -417,6 +533,7 @@ export const action = async ({ request }) => {
       where: {
         uploadId,
       },
+
       data: {
         selected: false,
       },
@@ -426,12 +543,14 @@ export const action = async ({ request }) => {
       buildReviewURL({
         uploadId,
         filters,
+
         page: currentPage,
       }),
     );
   }
 
   const pageIds = formData.getAll("pageIds").map(String);
+
   const selectedIds = formData.getAll("selectedIds").map(String);
 
   await saveCurrentPageSelection({
@@ -445,6 +564,7 @@ export const action = async ({ request }) => {
   if (intent === "go-page") {
     const targetPage = Math.max(
       1,
+
       Number(formData.get("targetPage") || currentPage),
     );
 
@@ -452,6 +572,7 @@ export const action = async ({ request }) => {
       buildReviewURL({
         uploadId,
         filters,
+
         page: targetPage,
       }),
     );
@@ -465,6 +586,7 @@ export const action = async ({ request }) => {
     buildReviewURL({
       uploadId,
       filters,
+
       page: currentPage,
     }),
   );
@@ -479,11 +601,30 @@ import {
 } from "@shopify/polaris-icons";
 
 const steps = [
-  { label: "Upload Data", icon: UploadIcon },
-  { label: "Select Products", icon: ProductIcon },
-  { label: "Filter & Preview", icon: FilterIcon },
-  { label: "Review & Select", icon: CheckCircleIcon },
-  { label: "Create Pages", icon: PageAddIcon },
+  {
+    label: "Upload Data",
+    icon: UploadIcon,
+  },
+
+  {
+    label: "Select Products",
+    icon: ProductIcon,
+  },
+
+  {
+    label: "Filter & Preview",
+    icon: FilterIcon,
+  },
+
+  {
+    label: "Review & Select",
+    icon: CheckCircleIcon,
+  },
+
+  {
+    label: "Create Pages",
+    icon: PageAddIcon,
+  },
 ];
 
 const statCardStyle = {
@@ -522,6 +663,7 @@ export default function Review() {
   } = useLoaderData();
 
   const navigation = useNavigation();
+
   const busy = navigation.state === "submitting";
 
   const [selectedIds, setSelectedIds] = useState(
@@ -576,11 +718,17 @@ export default function Review() {
   const hiddenContext = (
     <>
       <input type="hidden" name="uploadId" value={upload.id} />
+
       <input type="hidden" name="currentPage" value={page} />
+
       <input type="hidden" name="year" value={filters.year} />
+
       <input type="hidden" name="make" value={filters.make} />
+
       <input type="hidden" name="model" value={filters.model} />
+
       <input type="hidden" name="trim" value={filters.trim} />
+
       <input type="hidden" name="manufacturer" value={filters.manufacturer} />
     </>
   );
@@ -589,10 +737,21 @@ export default function Review() {
 
   filterQuery.set("uploadId", upload.id);
 
-  if (filters.year) filterQuery.set("year", filters.year);
-  if (filters.make) filterQuery.set("make", filters.make);
-  if (filters.model) filterQuery.set("model", filters.model);
-  if (filters.trim) filterQuery.set("trim", filters.trim);
+  if (filters.year) {
+    filterQuery.set("year", filters.year);
+  }
+
+  if (filters.make) {
+    filterQuery.set("make", filters.make);
+  }
+
+  if (filters.model) {
+    filterQuery.set("model", filters.model);
+  }
+
+  if (filters.trim) {
+    filterQuery.set("trim", filters.trim);
+  }
 
   if (filters.manufacturer) {
     filterQuery.set("manufacturer", filters.manufacturer);
@@ -603,58 +762,86 @@ export default function Review() {
       <div
         style={{
           display: "flex",
+
           flexDirection: "column",
+
           gap: "24px",
         }}
       >
+        {/* Workflow */}
         <div
           style={{
             display: "flex",
+
             alignItems: "center",
+
             gap: "8px",
+
             flexWrap: "wrap",
           }}
         >
           {steps.map((step, index) => {
             const Icon = step.icon;
+
             const isActive = index === 3;
 
             return (
               <div
                 key={step.label}
+
                 style={{
                   display: "flex",
+
                   alignItems: "center",
+
                   gap: "8px",
                 }}
               >
                 <div
                   style={{
                     width: "160px",
+
                     height: "40px",
+
                     display: "flex",
+
                     alignItems: "center",
+
                     justifyContent: "center",
+
                     gap: "7px",
+
                     padding: "0 10px",
+
                     boxSizing: "border-box",
+
                     borderRadius: "9px",
+
                     border: isActive
                       ? "1px solid #303030"
                       : "1px solid #d8d8d8",
+
                     background: isActive ? "#303030" : "#ffffff",
+
                     color: isActive ? "#ffffff" : "#616161",
+
                     fontSize: "14px",
+
                     fontWeight: isActive ? "650" : "500",
+
                     whiteSpace: "nowrap",
                   }}
                 >
                   <span
                     style={{
                       width: "16px",
+
                       height: "16px",
+
                       display: "inline-flex",
+
                       fill: isActive ? "#ffffff" : "#616161",
+
                       flexShrink: 0,
                     }}
                   >
@@ -682,16 +869,22 @@ export default function Review() {
           <div
             style={{
               marginTop: "16px",
+
               display: "flex",
+
               flexWrap: "wrap",
+
               gap: "10px",
             }}
           >
             <div
               style={{
                 padding: "9px 12px",
+
                 background: "#f6f6f7",
+
                 borderRadius: "8px",
+
                 fontSize: "13px",
               }}
             >
@@ -701,8 +894,11 @@ export default function Review() {
             <div
               style={{
                 padding: "9px 12px",
+
                 background: "#f6f6f7",
+
                 borderRadius: "8px",
+
                 fontSize: "13px",
               }}
             >
@@ -721,7 +917,9 @@ export default function Review() {
         <div
           style={{
             display: "grid",
+
             gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))",
+
             gap: "12px",
           }}
         >
@@ -729,26 +927,46 @@ export default function Review() {
             <div
               style={{
                 color: "#616161",
+
                 fontSize: "13px",
+
                 marginBottom: "5px",
               }}
             >
               Matching Vehicles
             </div>
-            <div style={{ fontSize: "25px", fontWeight: "700" }}>{total}</div>
+
+            <div
+              style={{
+                fontSize: "25px",
+
+                fontWeight: "700",
+              }}
+            >
+              {total}
+            </div>
           </div>
 
           <div style={statCardStyle}>
             <div
               style={{
                 color: "#616161",
+
                 fontSize: "13px",
+
                 marginBottom: "5px",
               }}
             >
               Selected Vehicles
             </div>
-            <div style={{ fontSize: "25px", fontWeight: "700" }}>
+
+            <div
+              style={{
+                fontSize: "25px",
+
+                fontWeight: "700",
+              }}
+            >
               {selectedCount}
             </div>
           </div>
@@ -757,13 +975,22 @@ export default function Review() {
             <div
               style={{
                 color: "#616161",
+
                 fontSize: "13px",
+
                 marginBottom: "5px",
               }}
             >
               Selected New Pages
             </div>
-            <div style={{ fontSize: "25px", fontWeight: "700" }}>
+
+            <div
+              style={{
+                fontSize: "25px",
+
+                fontWeight: "700",
+              }}
+            >
               {selectedPageCount}
             </div>
           </div>
@@ -772,13 +999,22 @@ export default function Review() {
             <div
               style={{
                 color: "#616161",
+
                 fontSize: "13px",
+
                 marginBottom: "5px",
               }}
             >
               Fully Duplicate Vehicles
             </div>
-            <div style={{ fontSize: "25px", fontWeight: "700" }}>
+
+            <div
+              style={{
+                fontSize: "25px",
+
+                fontWeight: "700",
+              }}
+            >
               {duplicateCount}
             </div>
           </div>
@@ -790,21 +1026,32 @@ export default function Review() {
           <div
             style={{
               marginTop: "12px",
+
               display: "flex",
+
               flexWrap: "wrap",
+
               gap: "10px",
             }}
           >
             <button
               type="button"
+
               onClick={toggleCurrentPage}
+
               style={{
                 display: "inline-block",
+
                 background: "#303030",
+
                 color: "#ffffff",
+
                 textDecoration: "none",
+
                 padding: "11px 18px",
+
                 borderRadius: "8px",
+
                 fontWeight: "650",
               }}
             >
@@ -818,18 +1065,28 @@ export default function Review() {
 
               <button
                 type="submit"
+
                 name="intent"
+
                 value="select-all-matching"
+
+                disabled={busy || total === 0}
+
                 style={{
                   display: "inline-block",
+
                   background: "#303030",
+
                   color: "#ffffff",
+
                   textDecoration: "none",
+
                   padding: "11px 18px",
+
                   borderRadius: "8px",
+
                   fontWeight: "650",
                 }}
-                disabled={busy || total === 0}
               >
                 Select All Matching Vehicles ({total})
               </button>
@@ -840,16 +1097,26 @@ export default function Review() {
 
               <button
                 type="submit"
+
                 name="intent"
+
                 value="clear-selection"
+
                 disabled={busy || selectedCount === 0}
+
                 style={{
                   display: "inline-block",
+
                   background: "#303030",
+
                   color: "#ffffff",
+
                   textDecoration: "none",
+
                   padding: "11px 18px",
+
                   borderRadius: "8px",
+
                   fontWeight: "650",
                 }}
               >
@@ -865,8 +1132,11 @@ export default function Review() {
           {records.map((record) => (
             <input
               key={`page-${record.id}`}
+
               type="hidden"
+
               name="pageIds"
+
               value={record.id}
             />
           ))}
@@ -874,8 +1144,11 @@ export default function Review() {
           {[...selectedIds].map((id) => (
             <input
               key={`selected-${id}`}
+
               type="hidden"
+
               name="selectedIds"
+
               value={id}
             />
           ))}
@@ -887,30 +1160,39 @@ export default function Review() {
               <div
                 style={{
                   marginTop: "12px",
+
                   overflowX: "auto",
+
                   border: "1px solid #e3e3e3",
+
                   borderRadius: "10px",
                 }}
               >
                 <table
                   style={{
                     width: "100%",
+
                     borderCollapse: "collapse",
+
                     background: "#ffffff",
                   }}
                 >
                   <thead>
                     <tr>
                       <th style={tableHeaderStyle}>Select</th>
+
                       <th align="left" style={tableHeaderStyle}>
                         Vehicle
                       </th>
+
                       <th align="left" style={tableHeaderStyle}>
                         Manufacturer
                       </th>
+
                       <th align="left" style={tableHeaderStyle}>
                         Compatibility
                       </th>
+
                       <th align="left" style={tableHeaderStyle}>
                         Product Pages
                       </th>
@@ -923,9 +1205,13 @@ export default function Review() {
                         <td style={tableCellStyle}>
                           <input
                             type="checkbox"
+
                             aria-label={`Select ${record.year} ${record.make} ${record.model} ${record.trim || ""}`}
+
                             checked={selectedIds.has(record.id)}
+
                             disabled={record.duplicate}
+
                             onChange={() => toggleRecord(record.id)}
                           />
                         </td>
@@ -934,6 +1220,7 @@ export default function Review() {
                           <strong>
                             {record.year} {record.make} {record.model}
                           </strong>
+
                           {record.trim && <div>{record.trim}</div>}
                         </td>
 
@@ -949,17 +1236,23 @@ export default function Review() {
                           <div
                             style={{
                               display: "flex",
+
                               flexDirection: "column",
+
                               gap: "7px",
                             }}
                           >
                             {record.proposals.map((proposal) => (
                               <div
                                 key={proposal.proposedHandle}
+
                                 style={{
                                   padding: "8px 10px",
+
                                   border: "1px solid #e3e3e3",
+
                                   borderRadius: "8px",
+
                                   background: proposal.duplicate
                                     ? "#fff8f7"
                                     : "#f5fbf6",
@@ -968,10 +1261,12 @@ export default function Review() {
                                 <div
                                   style={{
                                     fontSize: "11px",
+
                                     fontWeight: "650",
                                   }}
                                 >
                                   {proposal.duplicate ? "EXISTS" : "NEW"}
+
                                   {proposal.sourceProductHandle
                                     ? ` · ${proposal.sourceProductHandle}`
                                     : ""}
@@ -980,8 +1275,11 @@ export default function Review() {
                                 <code
                                   style={{
                                     display: "block",
+
                                     marginTop: "3px",
+
                                     fontSize: "12px",
+
                                     wordBreak: "break-word",
                                   }}
                                 >
@@ -1004,7 +1302,9 @@ export default function Review() {
               <div
                 style={{
                   marginTop: "18px",
+
                   display: "flex",
+
                   justifyContent: "space-between",
                 }}
               >
@@ -1012,14 +1312,20 @@ export default function Review() {
                   {page > 1 && (
                     <button
                       type="submit"
+
                       name="intent"
+
                       value="go-page"
+
                       onClick={(event) => {
                         const form = event.currentTarget.form;
+
                         const target = document.createElement("input");
 
                         target.type = "hidden";
+
                         target.name = "targetPage";
+
                         target.value = String(page - 1);
 
                         form.appendChild(target);
@@ -1038,22 +1344,34 @@ export default function Review() {
                   {page < totalPages && (
                     <button
                       type="submit"
+
                       name="intent"
+
                       value="go-page"
+
                       style={{
                         padding: "9px 14px",
+
                         borderRadius: "8px",
+
                         border: "1px solid #c9c9c9",
+
                         background: "#ffffff",
+
                         fontWeight: "650",
+
                         cursor: "pointer",
                       }}
+
                       onClick={(event) => {
                         const form = event.currentTarget.form;
+
                         const target = document.createElement("input");
 
                         target.type = "hidden";
+
                         target.name = "targetPage";
+
                         target.value = String(page + 1);
 
                         form.appendChild(target);
@@ -1070,7 +1388,9 @@ export default function Review() {
           <div
             style={{
               marginTop: "24px",
+
               display: "flex",
+
               justifyContent: "space-between",
             }}
           >
@@ -1080,16 +1400,26 @@ export default function Review() {
 
             <button
               type="submit"
+
               name="intent"
+
               value="continue"
+
               disabled={busy || (selectedCount === 0 && selectedIds.size === 0)}
+
               style={{
                 display: "inline-block",
+
                 background: "#303030",
+
                 color: "#ffffff",
+
                 textDecoration: "none",
+
                 padding: "11px 18px",
+
                 borderRadius: "8px",
+
                 fontWeight: "650",
               }}
             >

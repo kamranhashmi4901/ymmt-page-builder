@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import {
   Form,
   Link,
@@ -112,6 +112,9 @@ export default function JobProgress() {
   const navigation = useNavigation();
   const revalidator = useRevalidator();
 
+  const [downloadingCsv, setDownloadingCsv] = useState(false);
+  const [downloadError, setDownloadError] = useState("");
+
   const busy = navigation.state === "submitting";
 
   useEffect(() => {
@@ -128,6 +131,49 @@ export default function JobProgress() {
   const statusStyle = getStatusStyle(job.status);
 
   const isFinished = ["completed", "failed", "cancelled"].includes(job.status);
+
+  const downloadCreatedPagesCsv = async () => {
+    try {
+      setDownloadingCsv(true);
+      setDownloadError("");
+      const response = await fetch(`/app/job-export/${job.id}`, {
+        method: "GET",
+        credentials: "same-origin",
+      });
+      if (!response.ok) {
+        const message = await response.text();
+        throw new Error(
+          message || `CSV export failed with status ${response.status}.`,
+        );
+      }
+      const blob = await response.blob();
+      /*
+       * Read the filename returned by the server.
+       *
+       * Example:
+       * attachment; filename="ymmt-created-pages-2026-09-30-xxx.csv"
+       */
+      const disposition = response.headers.get("content-disposition") || "";
+      const filenameMatch = disposition.match(/filename="?([^"]+)"?/i);
+      const filename = filenameMatch?.[1] || `ymmt-created-pages-${job.id}.csv`;
+      /*
+       * Create a temporary browser download URL.
+       */
+      const downloadUrl = window.URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = downloadUrl;
+      anchor.download = filename;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(downloadUrl);
+    } catch (error) {
+      console.error("CSV download failed:", error);
+      setDownloadError(error?.message || "Unable to download the CSV file.");
+    } finally {
+      setDownloadingCsv(false);
+    }
+  };
 
   return (
     <s-page heading="YMMT Creation Job">
@@ -560,6 +606,34 @@ export default function JobProgress() {
             >
               {job.created} pages created, {job.skipped} skipped and{" "}
               {job.failed} failed.
+            </div>
+            <div
+              style={{
+                marginTop: "14px",
+              }}
+            >
+              <s-button
+                type="button"
+                icon="download"
+                disabled={downloadingCsv || job.created === 0}
+                onClick={downloadCreatedPagesCsv}
+              >
+                {downloadingCsv
+                  ? "Preparing CSV..."
+                  : "Download Created Pages CSV"}
+              </s-button>
+
+              {downloadError && (
+                <div
+                  style={{
+                    marginTop: "8px",
+                    color: "#8a2e1b",
+                    fontSize: "13px",
+                  }}
+                >
+                  {downloadError}
+                </div>
+              )}
             </div>
           </div>
         )}

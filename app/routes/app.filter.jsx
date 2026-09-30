@@ -56,7 +56,7 @@ export const loader = async ({ request }) => {
       uploadId,
       make,
       page: 1,
-      pageSize: 10000,
+      pageSize: 25,
     });
 
     models = [

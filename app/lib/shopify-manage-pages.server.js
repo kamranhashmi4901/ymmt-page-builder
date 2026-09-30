@@ -1,4 +1,5 @@
 import { buildYMMTPageContent } from "./ymmt-page-content.server";
+import { buildYMMTVehicleHandleBase } from "./ymmt-pages";
 
 /* =========================================================
    UPDATE PAGE CONTENT
@@ -140,55 +141,54 @@ export async function searchYMMTPages(admin, filters = {}) {
 
     const response = await admin.graphql(
       `#graphql
-          query ManagePages(
-            $after: String
-            $query: String
+        query ManagePages(
+          $after: String
+          $query: String
+        ) {
+          pages(
+            first: 100
+            after: $after
+            query: $query
           ) {
-            pages(
-              first: 100
-              after: $after
-              query: $query
-            ) {
-              nodes {
-                id
-                title
-                handle
-                templateSuffix
-                isPublished
+            nodes {
+              id
+              title
+              handle
+              templateSuffix
+              isPublished
 
-                vehicle: metafield(
-                  namespace: "ymmt"
-                  key: "vehicle"
-                ) {
-                  value
-                }
-
-                productHandle: metafield(
-                  namespace: "ymmt"
-                  key: "product_handle"
-                ) {
-                  value
-                }
-
-                sourceProductHandle: metafield(
-                  namespace: "ymmt"
-                  key: "source_product_handle"
-                ) {
-                  value
-                }
+              vehicle: metafield(
+                namespace: "ymmt"
+                key: "vehicle"
+              ) {
+                value
               }
 
-              pageInfo {
-                hasNextPage
-                endCursor
+              productHandle: metafield(
+                namespace: "ymmt"
+                key: "product_handle"
+              ) {
+                value
+              }
+
+              sourceProductHandle: metafield(
+                namespace: "ymmt"
+                key: "source_product_handle"
+              ) {
+                value
               }
             }
+
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
           }
-        `,
+        }
+      `,
       {
         variables: {
           after: cursor,
-
           query: shopifyQuery || null,
         },
       },
@@ -207,9 +207,7 @@ export async function searchYMMTPages(admin, filters = {}) {
     }
 
     for (const page of connection.nodes) {
-      const isYMMT = page.templateSuffix === "product-ymmt";
-
-      if (!isYMMT) {
+      if (page.templateSuffix !== "product-ymmt") {
         continue;
       }
 
@@ -223,13 +221,9 @@ export async function searchYMMTPages(admin, filters = {}) {
 
       const pageData = {
         id: page.id,
-
         title: page.title,
-
         handle: page.handle,
-
         templateSuffix: page.templateSuffix,
-
         isPublished: page.isPublished,
 
         productHandle: page.productHandle?.value || "",
@@ -237,11 +231,8 @@ export async function searchYMMTPages(admin, filters = {}) {
         sourceProductHandle: page.sourceProductHandle?.value || "",
 
         year: String(vehicle.year || ""),
-
         make: String(vehicle.make || ""),
-
         model: String(vehicle.model || ""),
-
         trim: String(vehicle.trim || ""),
 
         manufacturer: String(vehicle.manufacturer || ""),
@@ -296,21 +287,21 @@ export async function searchYMMTPages(admin, filters = {}) {
 export async function deleteShopifyPage(admin, pageId) {
   const response = await admin.graphql(
     `#graphql
-        mutation DeletePage(
-          $id: ID!
+      mutation DeletePage(
+        $id: ID!
+      ) {
+        pageDelete(
+          id: $id
         ) {
-          pageDelete(
-            id: $id
-          ) {
-            deletedPageId
+          deletedPageId
 
-            userErrors {
-              field
-              message
-            }
+          userErrors {
+            field
+            message
           }
         }
-      `,
+      }
+    `,
     {
       variables: {
         id: pageId,
@@ -346,21 +337,15 @@ export async function updateYMMTProductHandle(
   if (productHandle) {
     metafields.push({
       namespace: "ymmt",
-
       key: "product_handle",
-
       type: "single_line_text_field",
-
       value: productHandle,
     });
 
     metafields.push({
       namespace: "ymmt",
-
       key: "source_product_handle",
-
       type: "single_line_text_field",
-
       value: productHandle,
     });
   }
@@ -375,28 +360,28 @@ export async function updateYMMTProductHandle(
 
   const response = await admin.graphql(
     `#graphql
-        mutation UpdatePage(
-          $id: ID!
-          $page: PageUpdateInput!
+      mutation UpdatePage(
+        $id: ID!
+        $page: PageUpdateInput!
+      ) {
+        pageUpdate(
+          id: $id
+          page: $page
         ) {
-          pageUpdate(
-            id: $id
-            page: $page
-          ) {
-            page {
-              id
-              title
-              handle
-              templateSuffix
-            }
+          page {
+            id
+            title
+            handle
+            templateSuffix
+          }
 
-            userErrors {
-              field
-              message
-            }
+          userErrors {
+            field
+            message
           }
         }
-      `,
+      }
+    `,
     {
       variables: {
         id: pageId,
@@ -427,33 +412,33 @@ export async function updateYMMTProductHandle(
 export async function getShopifyPageSnapshot(admin, pageId) {
   const response = await admin.graphql(
     `#graphql
-        query GetPageSnapshot(
-          $id: ID!
-        ) {
-          page(id: $id) {
-            id
-            title
-            handle
-            body
-            templateSuffix
-            isPublished
-            publishedAt
+      query GetPageSnapshot(
+        $id: ID!
+      ) {
+        page(id: $id) {
+          id
+          title
+          handle
+          body
+          templateSuffix
+          isPublished
+          publishedAt
 
-            metafields(
-              first: 50
-              namespace: "ymmt"
-            ) {
-              nodes {
-                id
-                namespace
-                key
-                type
-                value
-              }
+          metafields(
+            first: 50
+            namespace: "ymmt"
+          ) {
+            nodes {
+              id
+              namespace
+              key
+              type
+              value
             }
           }
         }
-      `,
+      }
+    `,
     {
       variables: {
         id: pageId,
@@ -508,33 +493,32 @@ export async function restoreShopifyPageSnapshot(admin, snapshot) {
 
   const response = await admin.graphql(
     `#graphql
-        mutation RestorePage(
-          $id: ID!
-          $page: PageUpdateInput!
+      mutation RestorePage(
+        $id: ID!
+        $page: PageUpdateInput!
+      ) {
+        pageUpdate(
+          id: $id
+          page: $page
         ) {
-          pageUpdate(
-            id: $id
-            page: $page
-          ) {
-            page {
-              id
-              title
-              handle
-              templateSuffix
-              isPublished
-            }
+          page {
+            id
+            title
+            handle
+            templateSuffix
+            isPublished
+          }
 
-            userErrors {
-              field
-              message
-            }
+          userErrors {
+            field
+            message
           }
         }
-      `,
+      }
+    `,
     {
       variables: {
         id: snapshot.id,
-
         page,
       },
     },
@@ -569,6 +553,39 @@ function getVehicleKey(record) {
   return [record.year, record.make, record.model, record.trim || ""]
     .map(normalizeVehicleValue)
     .join("|");
+}
+
+/*
+ * Fallback matcher for older live-store pages that may not have a
+ * usable ymmt.vehicle metafield.
+ *
+ * Example:
+ *
+ * 1999-honda-accord-base-luxeline-seat-covers
+ *
+ * matches:
+ *
+ * 1999-honda-accord-base
+ */
+function findRecordFromPageHandle(pageHandle, candidates) {
+  const handle = String(pageHandle || "")
+    .trim()
+    .toLowerCase();
+
+  if (!handle) {
+    return null;
+  }
+
+  for (const candidate of candidates) {
+    if (
+      handle === candidate.vehicleHandle ||
+      handle.startsWith(`${candidate.vehicleHandle}-`)
+    ) {
+      return candidate.record;
+    }
+  }
+
+  return null;
 }
 
 function sleep(ms) {
@@ -666,20 +683,12 @@ export async function searchYMMTPagesByRecords(admin, records, options = {}) {
     };
   }
 
-  /*
-   * All JSON vehicles by unique
-   * Year|Make|Model|Trim key.
-   */
   const wantedVehicles = new Map();
 
   for (const record of records) {
     wantedVehicles.set(getVehicleKey(record), record);
   }
 
-  /*
-   * Group requested vehicles
-   * by year.
-   */
   const wantedKeysByYear = new Map();
 
   for (const record of records) {
@@ -696,11 +705,6 @@ export async function searchYMMTPagesByRecords(admin, records, options = {}) {
     wantedKeysByYear.get(year).add(getVehicleKey(record));
   }
 
-  /*
-   * IMPORTANT:
-   * calculate AFTER filling
-   * wantedKeysByYear.
-   */
   const totalYears = wantedKeysByYear.size;
 
   let processedYears = 0;
@@ -713,14 +717,6 @@ export async function searchYMMTPagesByRecords(admin, records, options = {}) {
 
   const seenPageIds = new Set();
 
-  /*
-   * Search one year at a time.
-   *
-   * We DO NOT stop after seeing
-   * every vehicle once because one
-   * vehicle can have multiple
-   * product-specific pages.
-   */
   for (const [year, wantedYearKeys] of wantedKeysByYear.entries()) {
     let cursor = null;
 
@@ -731,10 +727,38 @@ export async function searchYMMTPagesByRecords(admin, records, options = {}) {
     const foundYearKeys = new Set();
 
     /*
-     * 60 × 100 = maximum
-     * 6,000 candidate pages
-     * inspected per year.
+     * Build handles from the SAME rules
+     * used for page creation.
+     *
+     * Longest handles are checked first:
+     *
+     * accord-base
+     * before
+     * accord
+     *
+     * This protects the Base/no-trim distinction.
      */
+    const yearHandleCandidates = [];
+
+    for (const key of wantedYearKeys) {
+      const record = wantedVehicles.get(key);
+
+      if (!record) {
+        continue;
+      }
+
+      yearHandleCandidates.push({
+        key,
+        record,
+
+        vehicleHandle: buildYMMTVehicleHandleBase(record),
+      });
+    }
+
+    yearHandleCandidates.sort(
+      (a, b) => b.vehicleHandle.length - a.vehicleHandle.length,
+    );
+
     const MAX_REQUESTS_PER_YEAR = 60;
 
     console.log(
@@ -905,34 +929,71 @@ export async function searchYMMTPagesByRecords(admin, records, options = {}) {
           continue;
         }
 
-        if (!page.vehicle?.value) {
-          continue;
+        /*
+         * MATCH METHOD 1:
+         * Try ymmt.vehicle metafield.
+         */
+        let vehicle = null;
+
+        let originalRecord = null;
+
+        let key = null;
+
+        if (page.vehicle?.value) {
+          try {
+            const metafieldVehicle = JSON.parse(page.vehicle.value);
+
+            const metafieldKey = getVehicleKey(metafieldVehicle);
+
+            if (wantedYearKeys.has(metafieldKey)) {
+              vehicle = metafieldVehicle;
+
+              key = metafieldKey;
+
+              originalRecord = wantedVehicles.get(metafieldKey) || null;
+            }
+          } catch {
+            /*
+             * Ignore bad legacy metafield JSON.
+             * We will try handle matching below.
+             */
+          }
         }
 
-        let vehicle;
+        /*
+         * MATCH METHOD 2:
+         * Fall back to Shopify page handle.
+         *
+         * This supports older live-store pages
+         * that don't have ymmt.vehicle.
+         */
+        if (!originalRecord) {
+          const handleRecord = findRecordFromPageHandle(
+            page.handle,
+            yearHandleCandidates,
+          );
 
-        try {
-          vehicle = JSON.parse(page.vehicle.value);
-        } catch {
-          continue;
+          if (handleRecord) {
+            const handleKey = getVehicleKey(handleRecord);
+
+            if (wantedYearKeys.has(handleKey)) {
+              vehicle = handleRecord;
+
+              key = handleKey;
+
+              originalRecord = handleRecord;
+            }
+          }
         }
 
-        const key = getVehicleKey(vehicle);
-
-        if (!wantedYearKeys.has(key)) {
+        if (!originalRecord || !vehicle || !key) {
           continue;
         }
-
-        const originalRecord = wantedVehicles.get(key);
 
         matchedKeys.add(key);
 
         foundYearKeys.add(key);
 
-        /*
-         * Same Shopify page should
-         * never be added twice.
-         */
         if (seenPageIds.has(page.id)) {
           continue;
         }
@@ -979,14 +1040,6 @@ export async function searchYMMTPagesByRecords(admin, records, options = {}) {
 
       cursor = connection.pageInfo.endCursor;
 
-      /*
-       * Estimated progress within
-       * the current year.
-       *
-       * Exact percentage cannot be
-       * known because Shopify does not
-       * tell us total pages up-front.
-       */
       const estimatedYearFraction = Math.min(
         requestCount / MAX_REQUESTS_PER_YEAR,
 
@@ -1032,10 +1085,6 @@ export async function searchYMMTPagesByRecords(admin, records, options = {}) {
           `${pages.length} Shopify page(s) matched so far.`,
       });
 
-      /*
-       * Small pause protects the
-       * production store API budget.
-       */
       if (hasNextPage) {
         await sleep(250);
       }

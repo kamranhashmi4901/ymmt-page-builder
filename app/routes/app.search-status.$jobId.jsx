@@ -19,6 +19,20 @@ export const loader = async ({ request, params }) => {
 
   let pages = [];
   let missingRecords = [];
+  let searchMode = "json";
+  let filters = {};
+
+  try {
+    const stored = JSON.parse(job.recordsJson || "[]");
+
+    if (!Array.isArray(stored)) {
+      searchMode = stored?.mode || "json";
+      filters = stored?.filters || {};
+    }
+  } catch {
+    searchMode = "json";
+    filters = {};
+  }
 
   if (job.status === "completed") {
     try {
@@ -40,6 +54,10 @@ export const loader = async ({ request, params }) => {
     status: job.status,
 
     fileName: job.fileName,
+
+    searchMode,
+
+    filters,
 
     totalRecords: job.totalRecords,
 

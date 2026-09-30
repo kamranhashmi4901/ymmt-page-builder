@@ -1163,6 +1163,396 @@ export async function searchYMMTPagesByRecords(admin, records, options = {}) {
 }
 
 /* =========================================================
+   MANUAL SEARCH WITH LIVE PROGRESS
+========================================================= */
+
+export async function searchYMMTPagesByFilters(
+  admin,
+  filters = {},
+  options = {},
+) {
+  const onProgress =
+    typeof options.onProgress === "function"
+      ? options.onProgress
+      : async () => {};
+
+  const pages = [];
+  const seenPageIds = new Set();
+
+  const normalize = (value) =>
+    String(value || "")
+      .trim()
+      .toLowerCase();
+
+  const exactMatch = (value, filter) =>
+    !normalize(filter) || normalize(value) === normalize(filter);
+
+  const partialMatch = (value, filter) =>
+    !normalize(filter) || normalize(value).includes(normalize(filter));
+
+  /*
+   * Shopify cannot directly search inside the ymmt.vehicle JSON metafield.
+   *
+   * We therefore use the strongest useful filter to reduce the Shopify
+   * result set first, then apply the exact YMMT filters locally.
+   *
+   * Year is preferred because every YMMT page title/handle begins with
+   * the vehicle year.
+   */
+  const scopeTerm =
+    String(filters.year || "").trim() ||
+    String(filters.search || "").trim() ||
+    String(filters.make || "").trim() ||
+    String(filters.model || "").trim() ||
+    String(filters.trim || "").trim() ||
+    String(filters.productHandle || "").trim();
+
+  const shopifyQueryParts = [];
+
+  if (scopeTerm) {
+    shopifyQueryParts.push(scopeTerm);
+  }
+
+  if (filters.status === "published") {
+    shopifyQueryParts.push("published_status:published");
+  }
+
+  if (filters.status === "draft") {
+    shopifyQueryParts.push("published_status:unpublished");
+  }
+
+  const shopifyQuery = shopifyQueryParts.join(" AND ");
+
+  let cursor = null;
+  let hasNextPage = true;
+
+  let requestCount = 0;
+  let pagesChecked = 0;
+
+  /*
+   * Old manual search:
+   *
+   * 20 requests × 100 pages = 2,000 candidate pages.
+   *
+   * The background search can safely inspect much more while using
+   * Shopify throttle retry protection.
+   */
+  const MAX_REQUESTS = 150;
+
+  const filterSummary = Object.entries(filters)
+    .filter(([, value]) => String(value || "").trim())
+    .map(([key, value]) => `${key}=${value}`)
+    .join(", ");
+
+  await onProgress({
+    currentYear: filters.year || "All",
+
+    processedYears: 0,
+
+    requestCount: 0,
+
+    currentYearTotal: 0,
+
+    currentYearFound: 0,
+
+    currentYearMissing: 0,
+
+    pagesFound: 0,
+
+    missingCount: 0,
+
+    progress: 0,
+
+    message: `Manual search started${
+      filterSummary ? `: ${filterSummary}` : ""
+    }.`,
+  });
+
+  while (hasNextPage) {
+    if (requestCount >= MAX_REQUESTS) {
+      await onProgress({
+        currentYear: filters.year || "All",
+
+        processedYears: 1,
+
+        requestCount,
+
+        currentYearTotal: pagesChecked,
+
+        currentYearFound: pages.length,
+
+        currentYearMissing: 0,
+
+        pagesFound: pages.length,
+
+        missingCount: 0,
+
+        progress: 99,
+
+        message:
+          `Safety limit reached after ${requestCount} API requests. ` +
+          `Returning ${pages.length} matching page(s).`,
+      });
+
+      break;
+    }
+
+    requestCount += 1;
+
+    const json = await graphqlWithThrottleRetry(
+      admin,
+
+      `#graphql
+        query ManualYMMTPageSearch(
+          $after: String
+          $query: String
+        ) {
+          pages(
+            first: 100
+            after: $after
+            query: $query
+          ) {
+            nodes {
+              id
+              title
+              handle
+              templateSuffix
+              isPublished
+
+              vehicle: metafield(
+                namespace: "ymmt"
+                key: "vehicle"
+              ) {
+                value
+              }
+
+              productHandle: metafield(
+                namespace: "ymmt"
+                key: "product_handle"
+              ) {
+                value
+              }
+
+              sourceProductHandle: metafield(
+                namespace: "ymmt"
+                key: "source_product_handle"
+              ) {
+                value
+              }
+            }
+
+            pageInfo {
+              hasNextPage
+              endCursor
+            }
+          }
+        }
+      `,
+
+      {
+        variables: {
+          after: cursor,
+
+          query: shopifyQuery || null,
+        },
+      },
+
+      {
+        maxRetries: 6,
+
+        initialDelay: 1000,
+
+        onThrottle: async ({ attempt, delay }) => {
+          await onProgress({
+            currentYear: filters.year || "All",
+
+            processedYears: 0,
+
+            requestCount,
+
+            currentYearTotal: pagesChecked,
+
+            currentYearFound: pages.length,
+
+            currentYearMissing: 0,
+
+            pagesFound: pages.length,
+
+            missingCount: 0,
+
+            progress: Math.min(
+              95,
+              Math.max(1, Math.floor((requestCount / MAX_REQUESTS) * 100)),
+            ),
+
+            message:
+              `Shopify throttled manual search. ` +
+              `Retrying in ${Math.round(delay / 1000)}s ` +
+              `(attempt ${attempt})...`,
+          });
+        },
+      },
+    );
+
+    if (json.errors?.length) {
+      throw new Error(json.errors.map((error) => error.message).join(", "));
+    }
+
+    const connection = json.data?.pages;
+
+    if (!connection) {
+      break;
+    }
+
+    pagesChecked += connection.nodes.length;
+
+    for (const page of connection.nodes) {
+      /*
+       * Only manage YMMT pages.
+       */
+      if (page.templateSuffix !== "product-ymmt") {
+        continue;
+      }
+
+      let vehicle = {};
+
+      try {
+        vehicle = page.vehicle?.value ? JSON.parse(page.vehicle.value) : {};
+      } catch {
+        vehicle = {};
+      }
+
+      const pageData = {
+        id: page.id,
+
+        title: page.title,
+
+        handle: page.handle,
+
+        templateSuffix: page.templateSuffix,
+
+        isPublished: page.isPublished,
+
+        productHandle: page.productHandle?.value || "",
+
+        sourceProductHandle: page.sourceProductHandle?.value || "",
+
+        year: String(vehicle.year || ""),
+
+        make: String(vehicle.make || ""),
+
+        model: String(vehicle.model || ""),
+
+        trim: String(vehicle.trim || ""),
+
+        manufacturer: String(vehicle.manufacturer || ""),
+
+        compatibility: String(vehicle.compatible || vehicle.compat || ""),
+
+        warning: String(vehicle.warning || ""),
+      };
+
+      /*
+       * Apply the exact YMMT filters.
+       */
+      const matches =
+        partialMatch(`${pageData.title} ${pageData.handle}`, filters.search) &&
+        exactMatch(pageData.year, filters.year) &&
+        partialMatch(pageData.make, filters.make) &&
+        partialMatch(pageData.model, filters.model) &&
+        partialMatch(pageData.trim, filters.trim) &&
+        partialMatch(pageData.manufacturer, filters.manufacturer) &&
+        partialMatch(pageData.compatibility, filters.compatibility) &&
+        partialMatch(pageData.warning, filters.warning) &&
+        partialMatch(
+          `${pageData.productHandle} ${pageData.sourceProductHandle}`,
+          filters.productHandle,
+        ) &&
+        (!filters.status ||
+          (filters.status === "published" && pageData.isPublished) ||
+          (filters.status === "draft" && !pageData.isPublished));
+
+      if (matches && !seenPageIds.has(page.id)) {
+        seenPageIds.add(page.id);
+
+        pages.push(pageData);
+      }
+    }
+
+    hasNextPage = Boolean(connection.pageInfo.hasNextPage);
+
+    cursor = connection.pageInfo.endCursor;
+
+    const estimatedProgress = hasNextPage
+      ? Math.min(
+          95,
+          Math.max(1, Math.floor((requestCount / MAX_REQUESTS) * 100)),
+        )
+      : 99;
+
+    await onProgress({
+      currentYear: filters.year || "All",
+
+      processedYears: hasNextPage ? 0 : 1,
+
+      requestCount,
+
+      currentYearTotal: pagesChecked,
+
+      currentYearFound: pages.length,
+
+      currentYearMissing: 0,
+
+      pagesFound: pages.length,
+
+      missingCount: 0,
+
+      progress: estimatedProgress,
+
+      message:
+        `Request ${requestCount}: checked ${pagesChecked} ` +
+        `candidate page(s), found ${pages.length} ` +
+        `matching YMMT page(s).`,
+    });
+
+    if (hasNextPage) {
+      await sleep(250);
+    }
+  }
+
+  await onProgress({
+    currentYear: filters.year || "All",
+
+    processedYears: 1,
+
+    requestCount,
+
+    currentYearTotal: pagesChecked,
+
+    currentYearFound: pages.length,
+
+    currentYearMissing: 0,
+
+    pagesFound: pages.length,
+
+    missingCount: 0,
+
+    progress: 100,
+
+    message:
+      `Manual search completed. ` + `${pages.length} matching page(s) found.`,
+  });
+
+  return {
+    pages,
+
+    missingRecords: [],
+
+    pagesChecked,
+  };
+}
+
+/* =========================================================
    RECREATE DELETED PAGE
 ========================================================= */
 

@@ -14,7 +14,6 @@ import { authenticate } from "../shopify.server";
 import {
   deleteShopifyPage,
   getShopifyPageSnapshot,
-  searchYMMTPages,
   updateYMMTProductHandle,
   updateYMMTPageContent,
   restoreShopifyPageSnapshot,
@@ -75,7 +74,9 @@ export const loader = async ({ request }) => {
     (value) => String(value).trim() !== "",
   );
 
-  const pages = hasFilters ? await searchYMMTPages(admin, filters) : [];
+  // Manual search now runs as a persistent background job so large live stores
+  // do not block the route loader or stop after the first 2,000 pages.
+  const pages = [];
 
   const recentSessions = await getRecentActionSessions(session.shop, 10);
 
@@ -228,6 +229,64 @@ export const action = async ({ request }) => {
   }
 
   /* -------------------------------------------------------
+     MANUAL SEARCH
+  ------------------------------------------------------- */
+
+  if (intent === "manual-search") {
+    const filters = {
+      search: String(formData.get("search") || "").trim(),
+      year: String(formData.get("year") || "").trim(),
+      make: String(formData.get("make") || "").trim(),
+      model: String(formData.get("model") || "").trim(),
+      trim: String(formData.get("trim") || "").trim(),
+      manufacturer: String(formData.get("manufacturer") || "").trim(),
+      compatibility: String(formData.get("compatibility") || "").trim(),
+      warning: String(formData.get("warning") || "").trim(),
+      productHandle: String(formData.get("productHandle") || "").trim(),
+      status: String(formData.get("status") || "").trim(),
+    };
+
+    const hasManualFilters = Object.values(filters).some(Boolean);
+
+    if (!hasManualFilters) {
+      return {
+        success: false,
+        intent,
+        error: "Please enter at least one manual search filter.",
+      };
+    }
+
+    try {
+      const searchJob = await createYMMTPageSearchJob({
+        shop,
+        mode: "manual",
+        filters,
+        records: [],
+        fileName: "Manual Search",
+      });
+
+      startYMMTPageSearchJob({
+        jobId: searchJob.id,
+        shop,
+        admin,
+      });
+
+      return {
+        success: true,
+        intent: "manual-search-start",
+        jobId: searchJob.id,
+        filters,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        intent,
+        error: error.message || "Unable to start manual page search.",
+      };
+    }
+  }
+
+  /* -------------------------------------------------------
      JSON SEARCH
   ------------------------------------------------------- */
 
@@ -279,9 +338,8 @@ export const action = async ({ request }) => {
        */
       const searchJob = await createYMMTPageSearchJob({
         shop,
-
+        mode: "json",
         fileName: file.name,
-
         records: parsed.entries,
       });
 
@@ -718,6 +776,8 @@ export default function ManagePages() {
 
   const navigation = useNavigation();
 
+  const manualSearchFetcher = useFetcher();
+  const jsonSearchFetcher = useFetcher();
   const searchFetcher = useFetcher();
 
   const [step, setStep] = useState("select");
@@ -740,12 +800,63 @@ export default function ManagePages() {
      SEARCH JOB
   ------------------------------------------------------- */
 
-  const searchJobId =
-    actionData?.success && actionData?.intent === "json-search-start"
-      ? actionData.jobId
-      : null;
+  const [searchJobId, setSearchJobId] = useState(null);
+  const [searchLogs, setSearchLogs] = useState([]);
 
   const searchJob = searchFetcher.data;
+
+  useEffect(() => {
+    const data = manualSearchFetcher.data;
+
+    if (!data?.success || data.intent !== "manual-search-start") {
+      return;
+    }
+
+    setSearchMode("manual");
+
+    setSearchJobId(data.jobId);
+
+    setSearchLogs([
+      "[START] Manual search started.",
+      `[QUERY] ${Object.entries(data.filters || {})
+        .filter(([, value]) => String(value || "").trim())
+        .map(([key, value]) => `${key}=${value}`)
+        .join(", ")}`,
+    ]);
+  }, [manualSearchFetcher.data]);
+  useEffect(() => {
+    const data = jsonSearchFetcher.data;
+
+    if (!data?.success || data.intent !== "json-search-start") {
+      return;
+    }
+
+    setSearchMode("json");
+
+    setSearchJobId(data.jobId);
+
+    setSearchLogs([
+      `[START] JSON search started for ${data.fileName || "uploaded file"}.`,
+    ]);
+  }, [jsonSearchFetcher.data]);
+
+  useEffect(() => {
+    const message = searchJob?.message;
+
+    if (!message) {
+      return;
+    }
+
+    setSearchLogs((current) => {
+      const entry = `[${new Date().toLocaleTimeString()}] ${message}`;
+
+      if (current[current.length - 1]?.endsWith(message)) {
+        return current;
+      }
+
+      return [...current, entry].slice(-100);
+    });
+  }, [searchJob?.message]);
 
   const searchRunning =
     Boolean(searchJobId) &&
@@ -777,31 +888,39 @@ export default function ManagePages() {
     return () => clearInterval(timer);
   }, [searchJobId, searchJob?.status]);
 
-  const jsonPages =
+  const completedSearchPages =
     searchJob?.status === "completed" ? searchJob.pages || [] : [];
 
-  const resultPages = searchMode === "json" ? jsonPages : pages;
+  const resultPages = completedSearchPages;
 
   /* -------------------------------------------------------
      ROUTER STATES
   ------------------------------------------------------- */
 
-  const isSearching =
-    navigation.state === "loading" &&
-    navigation.location?.pathname === "/app/manage";
-
   const isSubmitting = navigation.state === "submitting";
 
   const submittingIntent = navigation.formData?.get("intent");
 
-  const isJsonStarting = isSubmitting && submittingIntent === "json-search";
+  const isManualStarting = manualSearchFetcher.state !== "idle";
 
-  const jsonBusy = isJsonStarting || searchRunning;
+  const isJsonStarting = jsonSearchFetcher.state !== "idle";
+
+  const manualBusy =
+    isManualStarting || (searchMode === "manual" && searchRunning);
+
+  const jsonBusy = isJsonStarting || (searchMode === "json" && searchRunning);
+
+  const searchBusy = manualBusy || jsonBusy;
+
+  const hasManualResults =
+    searchMode === "manual" && searchJob?.status === "completed";
 
   const hasJsonResults =
     searchMode === "json" && searchJob?.status === "completed";
 
-  const canShowResults = searchMode === "manual" ? hasFilters : hasJsonResults;
+  const canShowResults = hasManualResults || hasJsonResults;
+
+  const isSearching = searchBusy;
 
   /* -------------------------------------------------------
      SELECTION
@@ -836,7 +955,7 @@ export default function ManagePages() {
   };
 
   const switchSearchMode = (mode) => {
-    if (jsonBusy) {
+    if (searchBusy) {
       return;
     }
 
@@ -992,7 +1111,7 @@ export default function ManagePages() {
               <button
                 type="button"
 
-                disabled={jsonBusy}
+                disabled={searchBusy}
 
                 onClick={() => switchSearchMode("manual")}
 
@@ -1011,7 +1130,7 @@ export default function ManagePages() {
               <button
                 type="button"
 
-                disabled={jsonBusy}
+                disabled={searchBusy}
 
                 onClick={() => switchSearchMode("json")}
 
@@ -1041,7 +1160,9 @@ export default function ManagePages() {
                   to manage.
                 </s-paragraph>
 
-                <Form method="get">
+                <manualSearchFetcher.Form method="post">
+                  <input type="hidden" name="intent" value="manual-search" />
+
                   <div
                     style={{
                       marginTop: "16px",
@@ -1160,18 +1281,19 @@ export default function ManagePages() {
                       <button
                         type="submit"
 
-                        disabled={isSearching}
+                        disabled={manualBusy}
 
                         style={{
                           ...primaryButton,
 
-                          background: isSearching ? "#8c8c8c" : "#303030",
+                          background: manualBusy ? "#8c8c8c" : "#303030",
                         }}
                       >
-                        {isSearching ? "Searching..." : "Search Pages"}
+                        {manualBusy ? "Searching Pages..." : "Search Pages"}
                       </button>
 
-                      {Object.values(filters).some(Boolean) && (
+                      {(Object.values(filters).some(Boolean) ||
+                        hasManualResults) && (
                         <Link
                           to="/app/manage"
 
@@ -1188,46 +1310,29 @@ export default function ManagePages() {
                       )}
                     </div>
                   </div>
-                </Form>
+                </manualSearchFetcher.Form>
 
-                {isSearching && (
+                {manualSearchFetcher.data?.error && (
                   <div
                     style={{
-                      marginTop: "16px",
-
-                      padding: "16px",
-
-                      background: "#fafafa",
-
-                      border: "1px solid #e3e3e3",
-
-                      borderRadius: "10px",
-
-                      display: "flex",
-
-                      alignItems: "center",
-
-                      gap: "12px",
+                      marginTop: "12px",
+                      padding: "12px",
+                      background: "#fff4f4",
+                      border: "1px solid #f1b8b8",
+                      borderRadius: "8px",
+                      color: "#8a2e1b",
                     }}
                   >
-                    <Spinner />
-
-                    <div>
-                      <strong>Searching Shopify pages...</strong>
-
-                      <div
-                        style={{
-                          marginTop: "3px",
-
-                          color: "#616161",
-
-                          fontSize: "13px",
-                        }}
-                      >
-                        Checking pages against your selected filters.
-                      </div>
-                    </div>
+                    {manualSearchFetcher.data.error}
                   </div>
+                )}
+
+                {(manualBusy || (searchMode === "manual" && searchJob)) && (
+                  <SearchProgressPanel
+                    searchJob={searchJob}
+                    searchLogs={searchLogs}
+                    mode="manual"
+                  />
                 )}
               </s-section>
             )}
@@ -1245,7 +1350,10 @@ export default function ManagePages() {
                   Shopify pages are matched by Year, Make, Model and Trim.
                 </s-paragraph>
 
-                <Form method="post" encType="multipart/form-data">
+                <jsonSearchFetcher.Form
+                  method="post"
+                  encType="multipart/form-data"
+                >
                   <input type="hidden" name="intent" value="json-search" />
 
                   <div
@@ -1322,7 +1430,7 @@ export default function ManagePages() {
                       {jsonBusy ? "Searching Pages..." : "Find Pages From JSON"}
                     </button>
                   </div>
-                </Form>
+                </jsonSearchFetcher.Form>
 
                 {/* LIVE SEARCH PROGRESS */}
 
@@ -1474,11 +1582,42 @@ export default function ManagePages() {
                         searchJob?.message ||
                         "Preparing search..."}
                     </div>
+
+                    <SearchQueryLogs logs={searchLogs} />
                   </div>
                 )}
               </s-section>
             )}
           </>
+        )}
+
+        {searchMode === "manual" && searchJob?.status === "completed" && (
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+              gap: "12px",
+            }}
+          >
+            <StatCard
+              label="Matching Pages"
+              value={searchJob.pagesFound || 0}
+            />
+            <StatCard
+              label="Pages Checked"
+              value={searchJob.currentYearTotal || 0}
+            />
+            <StatCard
+              label="API Requests"
+              value={searchJob.requestCount || 0}
+            />
+            <StatCard
+              label="Search Scope"
+              value={
+                searchJob.filters?.year || searchJob.filters?.make || "Custom"
+              }
+            />
+          </div>
         )}
 
         {/* =================================================
@@ -2411,6 +2550,154 @@ export default function ManagePages() {
 /* =========================================================
    SMALL UI COMPONENTS
 ========================================================= */
+
+function SearchQueryLogs({ logs = [] }) {
+  if (!logs.length) {
+    return null;
+  }
+
+  return (
+    <div
+      style={{
+        marginTop: "14px",
+        background: "#151515",
+        color: "#f2f2f2",
+        borderRadius: "10px",
+        border: "1px solid #2c2c2c",
+        maxHeight: "260px",
+        overflowY: "auto",
+        fontFamily:
+          "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+        fontSize: "12px",
+      }}
+    >
+      {logs.map((log, index) => (
+        <div
+          key={`${index}-${log}`}
+          style={{
+            padding: "8px 11px",
+            borderBottom: "1px solid #2b2b2b",
+            lineHeight: "1.5",
+            color:
+              log.includes("failed") || log.includes("FAILED")
+                ? "#ff8a7a"
+                : log.includes("completed") || log.includes("DONE")
+                  ? "#6fdc8c"
+                  : "#9ecbff",
+          }}
+        >
+          {log}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function SearchProgressPanel({ searchJob, searchLogs, mode }) {
+  const isFinished = ["completed", "failed"].includes(searchJob?.status);
+
+  return (
+    <div
+      style={{
+        marginTop: "16px",
+        padding: "18px",
+        border: "1px solid #e3e3e3",
+        borderRadius: "12px",
+        background: "#fafafa",
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          alignItems: "center",
+          gap: "12px",
+        }}
+      >
+        <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+          {!isFinished && <Spinner />}
+          <strong>
+            {searchJob?.status === "completed"
+              ? "Search Completed"
+              : searchJob?.status === "failed"
+                ? "Search Failed"
+                : mode === "manual"
+                  ? "Searching Shopify Pages"
+                  : "Searching JSON Vehicles"}
+          </strong>
+        </div>
+
+        <strong>{searchJob?.progress ?? 0}%</strong>
+      </div>
+
+      <div
+        style={{
+          width: "100%",
+          height: "10px",
+          marginTop: "12px",
+          background: "#e3e3e3",
+          borderRadius: "999px",
+          overflow: "hidden",
+        }}
+      >
+        <div
+          style={{
+            width: `${searchJob?.progress ?? 0}%`,
+            height: "100%",
+            background: "#303030",
+            transition: "width 0.3s ease",
+          }}
+        />
+      </div>
+
+      <div
+        style={{
+          marginTop: "16px",
+          display: "grid",
+          gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))",
+          gap: "12px",
+        }}
+      >
+        <Stat
+          label={mode === "manual" ? "Search Scope" : "Current Year"}
+          value={
+            mode === "manual"
+              ? searchJob?.currentYear || "All"
+              : searchJob?.currentYear || "Preparing..."
+          }
+        />
+        <Stat
+          label={mode === "manual" ? "Pages Checked" : "Vehicles Found"}
+          value={
+            mode === "manual"
+              ? searchJob?.currentYearTotal || 0
+              : `${searchJob?.currentYearFound || 0} / ${
+                  searchJob?.currentYearTotal || 0
+                }`
+          }
+        />
+        <Stat label="Shopify Pages" value={searchJob?.pagesFound || 0} />
+        <Stat label="API Requests" value={searchJob?.requestCount || 0} />
+      </div>
+
+      <div
+        style={{
+          marginTop: "14px",
+          padding: "10px 12px",
+          background: "#ffffff",
+          border: "1px solid #e3e3e3",
+          borderRadius: "8px",
+          fontSize: "13px",
+          color: searchJob?.status === "failed" ? "#8a2e1b" : "#616161",
+        }}
+      >
+        {searchJob?.error || searchJob?.message || "Preparing search..."}
+      </div>
+
+      <SearchQueryLogs logs={searchLogs} />
+    </div>
+  );
+}
 
 function Spinner() {
   return (

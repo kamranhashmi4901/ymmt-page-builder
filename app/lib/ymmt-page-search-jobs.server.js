@@ -1,31 +1,49 @@
 import db from "../db.server";
 
-import { searchYMMTPagesByRecords } from "./shopify-manage-pages.server";
+import {
+  searchYMMTPagesByFilters,
+  searchYMMTPagesByRecords,
+} from "./shopify-manage-pages.server";
 
 const activeSearchJobs = new Set();
 
-export async function createYMMTPageSearchJob({ shop, fileName, records }) {
+export async function createYMMTPageSearchJob({
+  shop,
+  fileName = null,
+  records = [],
+  mode = "json",
+  filters = {},
+}) {
+  const safeRecords = Array.isArray(records) ? records : [];
+
   const years = [
     ...new Set(
-      records.map((record) => String(record.year || "").trim()).filter(Boolean),
+      safeRecords
+        .map((record) => String(record.year || "").trim())
+        .filter(Boolean),
     ),
   ];
+
+  const payload = {
+    mode,
+    filters,
+    records: safeRecords,
+  };
 
   return db.ymmtPageSearchJob.create({
     data: {
       shop,
-
       status: "pending",
-
-      fileName: fileName || null,
-
-      totalRecords: records.length,
-
-      totalYears: years.length,
-
-      recordsJson: JSON.stringify(records),
-
-      message: "Search queued.",
+      fileName: fileName || (mode === "manual" ? "Manual Search" : null),
+      totalRecords: mode === "manual" ? 0 : safeRecords.length,
+      totalYears:
+        mode === "manual"
+          ? String(filters.year || "").trim()
+            ? 1
+            : 0
+          : years.length,
+      recordsJson: JSON.stringify(payload),
+      message: mode === "manual" ? "Manual search queued." : "Search queued.",
     },
   });
 }
@@ -68,12 +86,23 @@ async function processSearchJob({ jobId, shop, admin }) {
       return;
     }
 
+    let mode = "json";
     let records = [];
+    let filters = {};
 
     try {
-      records = JSON.parse(job.recordsJson || "[]");
+      const stored = JSON.parse(job.recordsJson || "[]");
+
+      // Backward compatibility with old JSON-search jobs.
+      if (Array.isArray(stored)) {
+        records = stored;
+      } else {
+        mode = stored?.mode || "json";
+        records = Array.isArray(stored?.records) ? stored.records : [];
+        filters = stored?.filters || {};
+      }
     } catch {
-      throw new Error("Unable to read stored YMMT search records.");
+      throw new Error("Unable to read stored YMMT search data.");
     }
 
     await db.ymmtPageSearchJob.update({
@@ -86,7 +115,10 @@ async function processSearchJob({ jobId, shop, admin }) {
 
         startedAt: job.startedAt || new Date(),
 
-        message: "Starting Shopify page search...",
+        message:
+          mode === "manual"
+            ? "Starting manual Shopify page search..."
+            : "Starting Shopify page search...",
       },
     });
 
@@ -120,14 +152,14 @@ async function processSearchJob({ jobId, shop, admin }) {
       });
     };
 
-    const result = await searchYMMTPagesByRecords(
-      admin,
-      records,
-
-      {
-        onProgress: updateProgress,
-      },
-    );
+    const result =
+      mode === "manual"
+        ? await searchYMMTPagesByFilters(admin, filters, {
+            onProgress: updateProgress,
+          })
+        : await searchYMMTPagesByRecords(admin, records, {
+            onProgress: updateProgress,
+          });
 
     await db.ymmtPageSearchJob.update({
       where: {
@@ -141,11 +173,11 @@ async function processSearchJob({ jobId, shop, admin }) {
 
         pagesFound: result.pages.length,
 
-        missingCount: result.missingRecords.length,
+        missingCount: result.missingRecords?.length || 0,
 
         resultPagesJson: JSON.stringify(result.pages),
 
-        missingRecordsJson: JSON.stringify(result.missingRecords),
+        missingRecordsJson: JSON.stringify(result.missingRecords || []),
 
         message: "Search completed.",
 

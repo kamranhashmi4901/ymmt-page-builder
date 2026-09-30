@@ -726,14 +726,26 @@ export default function Review() {
           }}
         >
           <div style={statCardStyle}>
-            <div style={{ color: "#616161", fontSize: "13px" }}>
+            <div
+              style={{
+                color: "#616161",
+                fontSize: "13px",
+                marginBottom: "5px",
+              }}
+            >
               Matching Vehicles
             </div>
             <div style={{ fontSize: "25px", fontWeight: "700" }}>{total}</div>
           </div>
 
           <div style={statCardStyle}>
-            <div style={{ color: "#616161", fontSize: "13px" }}>
+            <div
+              style={{
+                color: "#616161",
+                fontSize: "13px",
+                marginBottom: "5px",
+              }}
+            >
               Selected Vehicles
             </div>
             <div style={{ fontSize: "25px", fontWeight: "700" }}>
@@ -742,7 +754,13 @@ export default function Review() {
           </div>
 
           <div style={statCardStyle}>
-            <div style={{ color: "#616161", fontSize: "13px" }}>
+            <div
+              style={{
+                color: "#616161",
+                fontSize: "13px",
+                marginBottom: "5px",
+              }}
+            >
               Selected New Pages
             </div>
             <div style={{ fontSize: "25px", fontWeight: "700" }}>
@@ -751,7 +769,13 @@ export default function Review() {
           </div>
 
           <div style={statCardStyle}>
-            <div style={{ color: "#616161", fontSize: "13px" }}>
+            <div
+              style={{
+                color: "#616161",
+                fontSize: "13px",
+                marginBottom: "5px",
+              }}
+            >
               Fully Duplicate Vehicles
             </div>
             <div style={{ fontSize: "25px", fontWeight: "700" }}>

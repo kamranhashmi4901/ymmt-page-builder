@@ -233,35 +233,75 @@ export default function CreatePages() {
           }}
         >
           <div style={summaryCardStyle}>
-            <div>Selected Vehicles</div>
+            <div
+              style={{
+                color: "#616161",
+                fontSize: "13px",
+                marginBottom: "5px",
+              }}
+            >
+              Selected Vehicles
+            </div>
             <div style={{ fontSize: "28px", fontWeight: "700" }}>
               {selectedCount}
             </div>
           </div>
 
           <div style={summaryCardStyle}>
-            <div>Selected Products</div>
+            <div
+              style={{
+                color: "#616161",
+                fontSize: "13px",
+                marginBottom: "5px",
+              }}
+            >
+              Selected Products
+            </div>
             <div style={{ fontSize: "28px", fontWeight: "700" }}>
               {productCount}
             </div>
           </div>
 
           <div style={summaryCardStyle}>
-            <div>New Pages to Create</div>
+            <div
+              style={{
+                color: "#616161",
+                fontSize: "13px",
+                marginBottom: "5px",
+              }}
+            >
+              New Pages to Create
+            </div>
             <div style={{ fontSize: "28px", fontWeight: "700" }}>
               {pageCount}
             </div>
           </div>
 
           <div style={summaryCardStyle}>
-            <div>Existing Pages Skipped</div>
+            <div
+              style={{
+                color: "#616161",
+                fontSize: "13px",
+                marginBottom: "5px",
+              }}
+            >
+              Existing Pages Skipped
+            </div>
             <div style={{ fontSize: "28px", fontWeight: "700" }}>
               {skippedExistingCount}
             </div>
           </div>
 
           <div style={summaryCardStyle}>
-            <div>Source File</div>
+            <div
+              style={{
+                color: "#616161",
+                fontSize: "13px",
+                marginBottom: "5px",
+              }}
+            >
+              Source File
+            </div>
             <div
               style={{
                 marginTop: "7px",

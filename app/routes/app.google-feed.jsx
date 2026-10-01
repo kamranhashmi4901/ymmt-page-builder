@@ -1,192 +1,88 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import {
-  Form,
   isRouteErrorResponse,
   useActionData,
   useFetcher,
   useLoaderData,
   useNavigation,
   useRouteError,
+  Form,
 } from "react-router";
 import { authenticate } from "../shopify.server";
+import {
+  createFeedJob,
+  feedJobView,
+  feedStorageRoot,
+  getFeedJob,
+  getLatestFeedJob,
+  queueFeedRetry,
+  startFeedJob,
+} from "../lib/google-feed-jobs.server";
 
-// Fetch one bounded batch; never scan the whole store during navigation.
-const PAGE_QUERY = `#graphql
-  query FeedPages($after: String) {
-    pages(first: 100, after: $after) {
-      nodes {
-        id title handle isPublished templateSuffix
-        vehicle: metafield(namespace: "ymmt", key: "vehicle") { value }
-        productHandle: metafield(namespace: "ymmt", key: "product_handle") { value }
-      }
-      pageInfo { hasNextPage endCursor }
-    }
-  }
-`;
-
-function parseVehicle(value) {
-  try {
-    const vehicle = JSON.parse(value || "{}");
-    return vehicle && typeof vehicle === "object" && !Array.isArray(vehicle)
-      ? vehicle
-      : {};
-  } catch {
-    return {};
-  }
-}
-
-function pageYear(page) {
-  const vehicle = parseVehicle(page.vehicle?.value);
-  const year = String(vehicle.year ?? vehicle.Year ?? "").trim();
-  if (/^\d{4}$/.test(year)) return year;
-  // Older pages may only store the year at the start of their handle.
-  return page.handle?.match(/^(\d{4})(?:-|$)/)?.[1] || "";
-}
-
-function throttleDelay(json, attempt) {
-  const cost = json?.extensions?.cost;
-  const status = cost?.throttleStatus;
-  const seconds =
-    status?.restoreRate > 0
-      ? Math.max(
-          0,
-          (cost.requestedQueryCost - status.currentlyAvailable) /
-            status.restoreRate,
-        )
-      : 0;
-  return Math.min(
-    5000,
-    Math.max(1000 * (attempt + 1), Math.ceil(seconds * 1000) + 250),
-  );
-}
-
-async function getPageBatch(admin, after = null) {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    let json;
-    try {
-      const response = await admin.graphql(PAGE_QUERY, {
-        variables: { after },
-      });
-      json = await response.json();
-      if (response.status === 429 && !json.errors?.length) {
-        json.errors = [
-          {
-            message: "Shopify is busy. Please try again.",
-            extensions: { code: "THROTTLED" },
-          },
-        ];
-      }
-    } catch (error) {
-      // Shopify's SDK can throw GraphqlQueryError before response.json().
-      const body = error.body;
-      const errors = Array.isArray(body?.errors)
-        ? body.errors
-        : body?.errors?.graphQLErrors;
-      if (errors?.length) json = { ...body, errors };
-      else if (error.response?.code === 429 || error.response?.status === 429) {
-        json = {
-          errors: [{ message: "Throttled", extensions: { code: "THROTTLED" } }],
-        };
-      } else throw error;
-    }
-    if (json.errors?.length) {
-      const throttled = json.errors.every(
-        (error) => error.extensions?.code === "THROTTLED",
-      );
-      if (throttled && attempt < 4) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, throttleDelay(json, attempt)),
-        );
-        continue;
-      }
-      throw new Error(json.errors.map((error) => error.message).join(", "));
-    }
-    const connection = json.data?.pages;
-    if (!Array.isArray(connection?.nodes) || !connection.pageInfo) {
-      throw new Error("Shopify did not return a valid pages response.");
-    }
-    if (
-      connection.pageInfo.hasNextPage &&
-      (!connection.pageInfo.endCursor ||
-        connection.pageInfo.endCursor === after)
-    ) {
-      throw new Error("Shopify returned an invalid pagination cursor.");
-    }
-    return connection;
-  }
-}
+const YEARS = Array.from({ length: 32 }, (_, index) => String(1996 + index));
+const ACTIVE = new Set(["queued", "building", "validating", "compressing"]);
 
 export const loader = async ({ request }) => {
   const { session, admin } = await authenticate.admin(request);
   const url = new URL(request.url);
-
-  if (url.searchParams.get("_feedSummary") === "1") {
-    const after = url.searchParams.get("after") || null;
-    const scan = url.searchParams.get("scan") || "";
-    try {
-      const connection = await getPageBatch(admin, after);
-      const pages = connection.nodes.filter(
-        (page) => page.templateSuffix === "product-ymmt",
-      );
-      return {
-        scan,
-        batchKey: after || "START",
-        scanned: connection.nodes.length,
-        totalPages: pages.length,
-        publishedCount: pages.filter((page) => page.isPublished).length,
-        years: [
-          ...new Set(
-            pages
-              .filter((page) => page.isPublished)
-              .map(pageYear)
-              .filter(Boolean),
-          ),
-        ],
-        hasNextPage: connection.pageInfo.hasNextPage,
-        nextCursor: connection.pageInfo.endCursor,
-      };
-    } catch (error) {
-      console.error("Google feed summary error:", error);
-      return {
-        scan,
-        error:
-          "Unable to load page statistics. Check the server logs, then retry. You can still prepare a feed link.",
-      };
+  try {
+    feedStorageRoot();
+    // These reads inspect saved export metadata only, never Shopify page counts.
+    const id = url.searchParams.get("job");
+    const job = id
+      ? await getFeedJob(session.shop, id)
+      : await getLatestFeedJob(session.shop);
+    if (job && ACTIVE.has(job.status)) {
+      // Resume a previously requested export after a server restart.
+      startFeedJob(session.shop, job.id, admin);
     }
+    return {
+      shop: session.shop,
+      job: feedJobView(job, url.origin),
+      storageError: "",
+    };
+  } catch (error) {
+    console.error("Google feed status error:", error);
+    return {
+      shop: session.shop,
+      job: null,
+      storageError: error.message || "Export storage is unavailable.",
+    };
   }
-
-  // Authentication only: opening this route does not query Shopify pages.
-  url.searchParams.set("_feedSummary", "1");
-  url.searchParams.delete("after");
-  url.searchParams.delete("scan");
-  return { shop: session.shop, summaryUrl: `${url.pathname}${url.search}` };
 };
 
 export const action = async ({ request }) => {
-  const { session } = await authenticate.admin(request);
+  const { session, admin } = await authenticate.admin(request);
   const form = await request.formData();
-  const year = String(form.get("year") || "").trim();
-  if (year && !/^\d{4}$/.test(year)) {
-    return {
-      success: false,
-      error: "Choose All years or enter a four-digit year.",
-    };
+  const url = new URL(request.url);
+  try {
+    if (form.get("intent") === "retry") {
+      const job = await queueFeedRetry(
+        session.shop,
+        String(form.get("jobId") || ""),
+      );
+      startFeedJob(session.shop, job.id, admin, { retry: true });
+      return { job: feedJobView(job, url.origin) };
+    }
+    const selected = String(form.get("year") || "");
+    if (selected !== "all" && !YEARS.includes(selected))
+      return { error: "Select a year from 1996 to 2027, or All years." };
+    const job = await createFeedJob(
+      session.shop,
+      selected === "all" ? "" : selected,
+    );
+    startFeedJob(session.shop, job.id, admin);
+    return { job: feedJobView(job, url.origin) };
+  } catch (error) {
+    console.error("Google feed create error:", error);
+    return { error: error.message || "Unable to start the export." };
   }
-  const url = new URL("/google-feed.xml", request.url);
-  url.searchParams.set("shop", session.shop);
-  if (year) url.searchParams.set("year", year);
-  return { success: true, feedUrl: url.toString(), year };
 };
 
-const initialSummary = {
-  totalPages: 0,
-  publishedCount: 0,
-  scanned: 0,
-  years: [],
-  complete: false,
-  error: "",
-};
-const buttonStyle = {
+const button = {
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
   padding: "10px 16px",
   borderRadius: "8px",
   border: "none",
@@ -194,135 +90,67 @@ const buttonStyle = {
   color: "#fff",
   fontWeight: 650,
   cursor: "pointer",
+  textDecoration: "none",
 };
-const cardStyle = {
+const secondary = {
+  ...button,
+  background: "#fff",
+  color: "#303030",
+  border: "1px solid #c9c9c9",
+};
+const card = {
   background: "#fff",
   border: "1px solid #e3e3e3",
   borderRadius: "12px",
   padding: "16px",
 };
+const bytes = (value) => `${((value || 0) / 1024 / 1024).toFixed(1)} MB`;
 
 export default function GoogleFeed() {
-  const { shop, summaryUrl } = useLoaderData();
+  const { shop, job: savedJob, storageError } = useLoaderData();
   const actionData = useActionData();
   const navigation = useNavigation();
-  const { load, data, state } = useFetcher();
-  const [summary, setSummary] = useState(initialSummary);
-  const [year, setYear] = useState("");
-  const [manualYear, setManualYear] = useState("");
-  const scanRef = useRef(0);
-  const processedRef = useRef(new Set());
-  const startedRef = useRef("");
-  const generating = navigation.state !== "idle";
-
-  const loadBatch = useCallback(
-    (after, scan) => {
-      const url = new URL(summaryUrl, window.location.origin);
-      url.searchParams.set("scan", String(scan));
-      if (after) url.searchParams.set("after", after);
-      else url.searchParams.delete("after");
-      load(`${url.pathname}${url.search}`);
-    },
-    [load, summaryUrl],
-  );
-
-  const refresh = useCallback(() => {
-    scanRef.current += 1;
-    processedRef.current = new Set();
-    setSummary({ ...initialSummary, years: [] });
-    loadBatch(null, scanRef.current);
-  }, [loadBatch]);
+  const statusFetcher = useFetcher();
+  const baseJob = actionData?.job || savedJob;
+  const polledJob = statusFetcher.data?.job;
+  const current =
+    polledJob?.id === baseJob?.id &&
+    Date.parse(polledJob.updatedAt) >= Date.parse(baseJob.updatedAt)
+      ? polledJob
+      : baseJob;
+  const [year, setYear] = useState(savedJob ? savedJob.year || "all" : "");
+  const busy = Boolean(current && ACTIVE.has(current.status));
+  const submitting = navigation.state !== "idle";
+  const statusError = statusFetcher.data?.storageError;
 
   useEffect(() => {
-    if (startedRef.current === shop) return;
-    startedRef.current = shop;
-    refresh();
-  }, [shop, refresh]);
+    if (!baseJob?.id || !busy || statusFetcher.state !== "idle") return;
+    const timer = setTimeout(() => {
+      statusFetcher.load(
+        `/app/google-feed?job=${encodeURIComponent(baseJob.id)}`,
+      );
+    }, 2500);
+    return () => clearTimeout(timer);
+  }, [
+    baseJob?.id,
+    busy,
+    statusFetcher.state,
+    statusFetcher.data,
+    statusFetcher.load,
+  ]);
 
-  useEffect(() => {
-    if (state !== "idle" || !data || data.scan !== String(scanRef.current))
-      return;
-    if (data.error) {
-      setSummary((previous) => ({ ...previous, error: data.error }));
-      return;
-    }
-    if (processedRef.current.has(data.batchKey)) return;
-    processedRef.current.add(data.batchKey);
-    setSummary((previous) => ({
-      totalPages: previous.totalPages + data.totalPages,
-      publishedCount: previous.publishedCount + data.publishedCount,
-      scanned: previous.scanned + data.scanned,
-      years: [...new Set([...previous.years, ...data.years])].sort(
-        (a, b) => Number(b) - Number(a),
-      ),
-      complete: !data.hasNextPage,
-      error: "",
-    }));
-    if (data.hasNextPage) loadBatch(data.nextCursor, scanRef.current);
-  }, [data, state, loadBatch]);
-
+  const titles = {
+    queued: "Export queued",
+    building: "Creating XML feed",
+    validating: "Checking the completed XML",
+    compressing: "Preparing the compressed download",
+    ready: "Your feed is ready",
+    failed: "Export needs attention",
+  };
   return (
     <s-page heading="Google Feed">
+      <style>{`@keyframes ymmt-feed-progress { from { transform: translateX(-100%); } to { transform: translateX(350%); } } @media (prefers-reduced-motion: reduce) { .ymmt-feed-progress { animation: none !important; } }`}</style>
       <div style={{ display: "flex", flexDirection: "column", gap: "20px" }}>
-        <s-section>
-          <strong>Google Merchant XML Feed</strong>
-          <s-paragraph>
-            Download product variants from published YMMT pages for one year or
-            all years.
-          </s-paragraph>
-        </s-section>
-
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-            gap: "12px",
-          }}
-        >
-          {[
-            ["YMMT Pages", summary.totalPages],
-            ["Published", summary.publishedCount],
-            ["Store", shop],
-          ].map(([label, value]) => (
-            <div key={label} style={cardStyle}>
-              <div style={{ color: "#616161", fontSize: "13px" }}>{label}</div>
-              <div
-                style={{
-                  fontSize: label === "Store" ? "16px" : "26px",
-                  fontWeight: 700,
-                  marginTop: "6px",
-                  wordBreak: "break-word",
-                }}
-              >
-                {label !== "Store" && !summary.complete && summary.scanned === 0
-                  ? "…"
-                  : value}
-              </div>
-            </div>
-          ))}
-        </div>
-
-        <div
-          aria-live="polite"
-          style={{
-            fontSize: "13px",
-            color: summary.error ? "#b42318" : "#616161",
-          }}
-        >
-          {summary.error ||
-            (summary.complete
-              ? "Page statistics are up to date."
-              : `Loading statistics in the background… ${summary.scanned} Shopify pages checked. Counts are provisional until complete.`)}
-          <button
-            type="button"
-            disabled={state !== "idle"}
-            onClick={refresh}
-            style={{ marginLeft: "12px" }}
-          >
-            {summary.error ? "Retry" : "Refresh statistics"}
-          </button>
-        </div>
-
         <s-section>
           <Form
             method="post"
@@ -333,107 +161,238 @@ export default function GoogleFeed() {
               gap: "12px",
             }}
           >
-            <strong>Prepare XML Feed</strong>
-            <label htmlFor="feed-year">Year</label>
+            <strong>Create XML Feed</strong>
+            <label htmlFor="feed-year">Select year</label>
             <select
               id="feed-year"
+              name="year"
               value={year}
               onChange={(event) => setYear(event.target.value)}
+              disabled={busy || submitting}
+              required
               style={{
-                padding: "10px",
-                minWidth: "220px",
+                padding: "10px 12px",
+                minWidth: "240px",
+                maxWidth: "100%",
                 borderRadius: "8px",
-                border: "1px solid #ccc",
+                border: "1px solid #c9c9c9",
+                background: "#fff",
               }}
             >
-              <option value="">All years — complete XML feed</option>
-              {summary.years.map((value) => (
+              <option value="" disabled>
+                Select a year
+              </option>
+              {YEARS.map((value) => (
                 <option key={value} value={value}>
                   {value}
                 </option>
               ))}
-              <option value="custom">Enter a year…</option>
+              <option value="all">All years — complete feed</option>
             </select>
-            {year === "custom" && (
-              <div>
-                <label htmlFor="manual-year">Enter year </label>
-                <input
-                  id="manual-year"
-                  value={manualYear}
-                  onChange={(event) => setManualYear(event.target.value)}
-                  inputMode="numeric"
-                  pattern="[0-9]{4}"
-                  maxLength={4}
-                  required
-                  placeholder="2027"
-                  style={{ padding: "8px", width: "100px" }}
-                />
-              </div>
-            )}
-            <input
-              type="hidden"
-              name="year"
-              value={year === "custom" ? manualYear : year}
-            />
-            <div style={{ color: "#616161", fontSize: "13px" }}>
-              Each product variant linked to a published product-ymmt page
-              becomes a separate feed item. Available years appear as statistics
-              load; you can also enter a year directly.
+            <div
+              style={{ color: "#616161", fontSize: "13px", lineHeight: 1.5 }}
+            >
+              Create a feed for one year or all years. Searching starts when you
+              click Create XML Feed.
             </div>
             <button
               type="submit"
-              disabled={generating}
-              style={{ ...buttonStyle, opacity: generating ? 0.6 : 1 }}
+              disabled={!year || busy || submitting || Boolean(storageError)}
+              style={{
+                ...button,
+                opacity: !year || busy || submitting || storageError ? 0.5 : 1,
+              }}
             >
-              {generating ? "Preparing…" : "Prepare download link"}
+              {submitting
+                ? "Starting…"
+                : busy
+                  ? "Export in progress…"
+                  : "Create XML Feed"}
             </button>
-            {actionData?.error && (
-              <div role="alert" style={{ color: "#b42318" }}>
-                {actionData.error}
-              </div>
-            )}
+            <div
+              style={{
+                color: "#616161",
+                fontSize: "12px",
+                wordBreak: "break-word",
+              }}
+            >
+              {shop}
+            </div>
           </Form>
         </s-section>
 
-        {actionData?.success && (
+        {(storageError || actionData?.error || statusError) && (
+          <div
+            role="alert"
+            style={{
+              ...card,
+              background: "#fff4f4",
+              color: "#8a2e1b",
+              borderColor: "#f1b8b8",
+            }}
+          >
+            {storageError || actionData?.error || statusError}
+          </div>
+        )}
+
+        {current && (
           <s-section>
             <div
               style={{
-                ...cardStyle,
-                background: "#f1fff2",
-                borderColor: "#b7ddb9",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                gap: "12px",
+                flexWrap: "wrap",
               }}
             >
-              <strong>
-                Download link ready — {actionData.year || "all years"}
+              <strong aria-live="polite">
+                {titles[current.status] || current.status}
               </strong>
-              <p>
-                The XML is built when you open this link. Large stores may take
-                longer to finish downloading.
-              </p>
-              <a
-                href={actionData.feedUrl}
-                target="_blank"
-                rel="noreferrer"
+              <span
                 style={{
-                  ...buttonStyle,
-                  display: "inline-block",
-                  textDecoration: "none",
-                }}
-              >
-                Download {actionData.year ? `${actionData.year} ` : "Complete "}
-                XML Feed
-              </a>
-              <div
-                style={{
-                  marginTop: "12px",
-                  wordBreak: "break-all",
+                  padding: "5px 10px",
+                  borderRadius: "999px",
+                  background:
+                    current.status === "ready" ? "#eaf8ec" : "#f4f4f4",
+                  color: "#303030",
                   fontSize: "12px",
                 }}
               >
-                <code>{actionData.feedUrl}</code>
-              </div>
+                {current.year || "All years"}
+              </span>
             </div>
+            {busy && (
+              <>
+                <div
+                  role="progressbar"
+                  aria-label="Feed export is in progress"
+                  style={{
+                    marginTop: "16px",
+                    height: "6px",
+                    borderRadius: "8px",
+                    background: "#e3e3e3",
+                    overflow: "hidden",
+                  }}
+                >
+                  <div
+                    className="ymmt-feed-progress"
+                    style={{
+                      width: "30%",
+                      height: "100%",
+                      background: "#303030",
+                      borderRadius: "8px",
+                      animation: "ymmt-feed-progress 2s linear infinite",
+                    }}
+                  />
+                </div>
+                <p
+                  style={{
+                    color: "#616161",
+                    fontSize: "13px",
+                    lineHeight: 1.5,
+                  }}
+                >
+                  The export runs in the background. You can leave this page and
+                  return to download it when ready.
+                </p>
+              </>
+            )}
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+                gap: "12px",
+                marginTop: "16px",
+              }}
+            >
+              {[
+                ["Pages checked", current.pagesChecked],
+                ["Pages included", current.pagesIncluded],
+                ["Variant offers", current.offers],
+                ["XML size", bytes(current.bytes)],
+              ].map(([label, value]) => (
+                <div key={label} style={card}>
+                  <div style={{ color: "#616161", fontSize: "12px" }}>
+                    {label}
+                  </div>
+                  <strong
+                    style={{
+                      display: "block",
+                      marginTop: "6px",
+                      fontSize: "24px",
+                    }}
+                  >
+                    {typeof value === "number" ? value.toLocaleString() : value}
+                  </strong>
+                </div>
+              ))}
+            </div>
+            {current.status === "failed" && (
+              <div
+                role="alert"
+                style={{
+                  marginTop: "16px",
+                  ...card,
+                  background: "#fff4f4",
+                  borderColor: "#f1b8b8",
+                }}
+              >
+                <p style={{ marginTop: 0 }}>{current.error}</p>
+                <p style={{ color: "#616161", fontSize: "13px" }}>
+                  Progress is saved. Correct the issue, then retry to resume
+                  from the last saved page.
+                </p>
+                <Form method="post">
+                  <input type="hidden" name="intent" value="retry" />
+                  <input type="hidden" name="jobId" value={current.id} />
+                  <button type="submit" disabled={submitting} style={button}>
+                    Retry export
+                  </button>
+                </Form>
+              </div>
+            )}
+            {current.status === "ready" && current.gzipUrl && (
+              <div
+                style={{
+                  marginTop: "16px",
+                  ...card,
+                  background: "#f1fff2",
+                  borderColor: "#b7ddb9",
+                }}
+              >
+                <strong>Completed XML checked successfully</strong>
+                <p
+                  style={{
+                    color: "#616161",
+                    fontSize: "13px",
+                    lineHeight: 1.5,
+                  }}
+                >
+                  Download the compressed file for a smaller transfer, or choose
+                  the original XML. Both use the same completed export. You can
+                  retry either download without recreating the feed.
+                </p>
+                <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+                  <a
+                    href={current.gzipUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={button}
+                  >
+                    Download XML.GZ · {bytes(current.gzipBytes)}
+                  </a>
+                  <a
+                    href={current.xmlUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={secondary}
+                  >
+                    Download XML · {bytes(current.bytes)}
+                  </a>
+                </div>
+              </div>
+            )}
           </s-section>
         )}
       </div>
@@ -452,13 +411,13 @@ export function ErrorBoundary() {
             Unable to open Google Feed{status ? ` (${status})` : ""}.
           </strong>
           <p>
-            Reopen the app from Shopify Admin. If this continues, check Railway
-            logs for this request.
+            Reopen the app from Shopify Admin. If this continues, check the
+            server logs.
           </p>
           <button
             type="button"
+            style={button}
             onClick={() => window.location.reload()}
-            style={buttonStyle}
           >
             Reload
           </button>

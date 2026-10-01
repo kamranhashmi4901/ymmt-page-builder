@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   Form,
@@ -39,6 +39,91 @@ import {
   startYMMTPageSearchJob,
 } from "../lib/ymmt-page-search-jobs.server";
 
+// Fetch one bounded batch; never scan the whole store during navigation.
+const MANAGE_STATS_QUERY = `#graphql
+  query ManagePageStatistics($after: String) {
+    pages(first: 100, after: $after) {
+      nodes {
+        isPublished templateSuffix
+      }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+`;
+
+function throttleDelay(json, attempt) {
+  const cost = json?.extensions?.cost;
+  const status = cost?.throttleStatus;
+  const seconds =
+    status?.restoreRate > 0
+      ? Math.max(
+          0,
+          (cost.requestedQueryCost - status.currentlyAvailable) /
+            status.restoreRate,
+        )
+      : 0;
+  return Math.min(
+    5000,
+    Math.max(1000 * (attempt + 1), Math.ceil(seconds * 1000) + 250),
+  );
+}
+
+async function getManageStatsBatch(admin, after = null) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    let json;
+    try {
+      const response = await admin.graphql(MANAGE_STATS_QUERY, {
+        variables: { after },
+      });
+      json = await response.json();
+      if (response.status === 429 && !json.errors?.length) {
+        json.errors = [
+          {
+            message: "Shopify is busy. Please try again.",
+            extensions: { code: "THROTTLED" },
+          },
+        ];
+      }
+    } catch (error) {
+      // Shopify's SDK can throw GraphqlQueryError before response.json().
+      const body = error.body;
+      const errors = Array.isArray(body?.errors)
+        ? body.errors
+        : body?.errors?.graphQLErrors;
+      if (errors?.length) json = { ...body, errors };
+      else if (error.response?.code === 429 || error.response?.status === 429) {
+        json = {
+          errors: [{ message: "Throttled", extensions: { code: "THROTTLED" } }],
+        };
+      } else throw error;
+    }
+    if (json.errors?.length) {
+      const throttled = json.errors.every(
+        (error) => error.extensions?.code === "THROTTLED",
+      );
+      if (throttled && attempt < 4) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, throttleDelay(json, attempt)),
+        );
+        continue;
+      }
+      throw new Error(json.errors.map((error) => error.message).join(", "));
+    }
+    const connection = json.data?.pages;
+    if (!Array.isArray(connection?.nodes) || !connection.pageInfo) {
+      throw new Error("Shopify did not return a valid pages response.");
+    }
+    if (
+      connection.pageInfo.hasNextPage &&
+      (!connection.pageInfo.endCursor ||
+        connection.pageInfo.endCursor === after)
+    ) {
+      throw new Error("Shopify returned an invalid pagination cursor.");
+    }
+    return connection;
+  }
+}
+
 /* =========================================================
    LOADER
 ========================================================= */
@@ -47,6 +132,41 @@ export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
 
   const url = new URL(request.url);
+
+  if (url.searchParams.get("_manageSummary") === "1") {
+    const after = url.searchParams.get("after") || null;
+    const scan = url.searchParams.get("scan") || "";
+    try {
+      const connection = await getManageStatsBatch(admin, after);
+      const ymmtPages = connection.nodes.filter(
+        (page) => page.templateSuffix === "product-ymmt",
+      );
+      const publishedCount = ymmtPages.filter(
+        (page) => page.isPublished,
+      ).length;
+      return {
+        scan,
+        batchKey: after || "START",
+        scanned: connection.nodes.length,
+        totalPages: ymmtPages.length,
+        publishedCount,
+        draftCount: ymmtPages.length - publishedCount,
+        hasNextPage: connection.pageInfo.hasNextPage,
+        nextCursor: connection.pageInfo.endCursor,
+      };
+    } catch (error) {
+      console.error("Manage page statistics error:", error);
+      return {
+        scan,
+        error:
+          "Unable to load page statistics. Check the server logs, then retry.",
+      };
+    }
+  }
+  const summaryUrl = new URL(request.url);
+  summaryUrl.searchParams.set("_manageSummary", "1");
+  summaryUrl.searchParams.delete("after");
+  summaryUrl.searchParams.delete("scan");
 
   const filters = {
     search: url.searchParams.get("search") || "",
@@ -89,6 +209,8 @@ export const loader = async ({ request }) => {
   }
 
   return {
+    shop: session.shop,
+    summaryUrl: `${summaryUrl.pathname}${summaryUrl.search}`,
     pages,
     filters,
     recentSessions,
@@ -768,13 +890,91 @@ const cellStyle = {
    COMPONENT
 ========================================================= */
 
+const initialManageSummary = {
+  totalPages: 0,
+  publishedCount: 0,
+  draftCount: 0,
+  scanned: 0,
+  complete: false,
+  error: "",
+};
+
 export default function ManagePages() {
-  const { pages, filters, recentSessions, hasFilters, selectedSession } =
-    useLoaderData();
+  const {
+    shop,
+    summaryUrl,
+    pages,
+    filters,
+    recentSessions,
+    hasFilters,
+    selectedSession,
+  } = useLoaderData();
 
   const actionData = useActionData();
 
   const navigation = useNavigation();
+
+  const {
+    load: loadStatistics,
+    data: statisticsData,
+    state: statisticsState,
+  } = useFetcher();
+  const [pageSummary, setPageSummary] = useState(initialManageSummary);
+  const statisticsScanRef = useRef(0);
+  const statisticsProcessedRef = useRef(new Set());
+  const statisticsStartedRef = useRef("");
+
+  const loadStatisticsBatch = useCallback(
+    (after, scan) => {
+      const url = new URL(summaryUrl, window.location.origin);
+      url.searchParams.set("scan", String(scan));
+      if (after) url.searchParams.set("after", after);
+      else url.searchParams.delete("after");
+      loadStatistics(`${url.pathname}${url.search}`);
+    },
+    [loadStatistics, summaryUrl],
+  );
+
+  const refreshStatistics = useCallback(() => {
+    statisticsScanRef.current += 1;
+    statisticsProcessedRef.current = new Set();
+    setPageSummary({ ...initialManageSummary });
+    loadStatisticsBatch(null, statisticsScanRef.current);
+  }, [loadStatisticsBatch]);
+
+  useEffect(() => {
+    if (statisticsStartedRef.current === shop) return;
+    statisticsStartedRef.current = shop;
+    refreshStatistics();
+  }, [shop, refreshStatistics]);
+
+  useEffect(() => {
+    if (
+      statisticsState !== "idle" ||
+      !statisticsData ||
+      statisticsData.scan !== String(statisticsScanRef.current)
+    )
+      return;
+    if (statisticsData.error) {
+      setPageSummary((previous) => ({
+        ...previous,
+        error: statisticsData.error,
+      }));
+      return;
+    }
+    if (statisticsProcessedRef.current.has(statisticsData.batchKey)) return;
+    statisticsProcessedRef.current.add(statisticsData.batchKey);
+    setPageSummary((previous) => ({
+      totalPages: previous.totalPages + statisticsData.totalPages,
+      publishedCount: previous.publishedCount + statisticsData.publishedCount,
+      scanned: previous.scanned + statisticsData.scanned,
+      draftCount: previous.draftCount + statisticsData.draftCount,
+      complete: !statisticsData.hasNextPage,
+      error: "",
+    }));
+    if (statisticsData.hasNextPage)
+      loadStatisticsBatch(statisticsData.nextCursor, statisticsScanRef.current);
+  }, [statisticsData, statisticsState, loadStatisticsBatch]);
 
   const manualSearchFetcher = useFetcher();
   const jsonSearchFetcher = useFetcher();
@@ -1076,6 +1276,65 @@ export default function ManagePages() {
     <s-page heading="Manage YMMT Pages">
       <style>
         {`
+
+          .ymmt-total-toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+          }
+          .ymmt-search-toolbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 16px;
+            border: 1px solid #e3e3e3;
+            border-radius: 12px;
+            background: #ffffff;
+          }
+          .ymmt-search-methods {
+            display: flex;
+            gap: 4px;
+            padding: 4px;
+            border: 1px solid #e3e3e3;
+            border-radius: 10px;
+            background: #f4f4f4;
+          }
+          .ymmt-search-method {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            min-height: 40px;
+            padding: 9px 14px;
+            border: 0;
+            border-radius: 7px;
+            background: transparent;
+            color: #616161;
+            font: inherit;
+            font-size: 13px;
+            font-weight: 600;
+            white-space: nowrap;
+            cursor: pointer;
+            transition: background 150ms ease, color 150ms ease;
+          }
+          .ymmt-search-method:hover:not(:disabled) { background: #e8e8e8; color: #303030; }
+          .ymmt-search-method[aria-pressed="true"],
+          .ymmt-search-method[aria-pressed="true"]:hover:not(:disabled) {
+            background: #303030;
+            color: #ffffff;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+          }
+          .ymmt-search-method:focus-visible { outline: 2px solid #005bd3; outline-offset: 2px; }
+          .ymmt-search-method:disabled { opacity: 0.55; cursor: not-allowed; }
+          @media (max-width: 600px) {
+            .ymmt-search-toolbar { align-items: stretch; flex-direction: column; gap: 12px; }
+            .ymmt-search-methods { width: 100%; box-sizing: border-box; }
+            .ymmt-search-method { flex: 1; min-width: 0; padding: 9px 8px; font-size: 12px; white-space: normal; }
+          }
+
           @keyframes ymmt-spin {
             to {
               transform: rotate(360deg);
@@ -1093,58 +1352,138 @@ export default function ManagePages() {
           gap: "18px",
         }}
       >
+        {/* Store-wide YMMT page statistics, loaded in bounded background batches. */}
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+            gap: "12px",
+          }}
+        >
+          <StatCard
+            label="Total YMMT Pages"
+            value={
+              !pageSummary.complete && pageSummary.scanned === 0
+                ? "…"
+                : pageSummary.totalPages
+            }
+          />
+          <StatCard
+            label="Published"
+            value={
+              !pageSummary.complete && pageSummary.scanned === 0
+                ? "…"
+                : pageSummary.publishedCount
+            }
+          />
+          <StatCard
+            label="Drafts"
+            value={
+              !pageSummary.complete && pageSummary.scanned === 0
+                ? "…"
+                : pageSummary.draftCount
+            }
+          />
+        </div>
+        <div
+          className="ymmt-total-toolbar"
+          aria-live="polite"
+          style={{
+            fontSize: "13px",
+            color: pageSummary.error ? "#b42318" : "#616161",
+          }}
+        >
+          <span>
+            {pageSummary.error ||
+              (pageSummary.complete
+                ? "Totals include all pages using the product-ymmt template, across every year."
+                : `Loading page totals… ${pageSummary.scanned} Shopify pages checked. Counts are provisional until complete.`)}
+          </span>
+          <button
+            type="button"
+            disabled={statisticsState !== "idle"}
+            onClick={refreshStatistics}
+            style={{ ...secondaryButton, flexShrink: 0 }}
+          >
+            {pageSummary.error ? "Retry" : "Refresh totals"}
+          </button>
+        </div>
+
         {/* =================================================
             STEP 1 SEARCH
         ================================================= */}
 
         {!canShowResults && (
           <>
-            <div
-              style={{
-                display: "flex",
-
-                gap: "8px",
-
-                flexWrap: "wrap",
-              }}
-            >
-              <button
-                type="button"
-
-                disabled={searchBusy}
-
-                onClick={() => switchSearchMode("manual")}
-
-                style={{
-                  ...secondaryButton,
-
-                  border:
-                    searchMode === "manual"
-                      ? "2px solid #303030"
-                      : "1px solid #c9c9c9",
-                }}
+            <div className="ymmt-search-toolbar">
+              <div>
+                <strong style={{ fontSize: "14px", color: "#303030" }}>
+                  Search method
+                </strong>
+                <div
+                  style={{
+                    marginTop: "4px",
+                    fontSize: "12px",
+                    color: "#616161",
+                    lineHeight: 1.5,
+                  }}
+                >
+                  Filter pages manually or upload your YMMT JSON.
+                </div>
+              </div>
+              <div
+                className="ymmt-search-methods"
+                role="group"
+                aria-label="Search method"
               >
-                Manual Search
-              </button>
-
-              <button
-                type="button"
-
-                disabled={searchBusy}
-
-                onClick={() => switchSearchMode("json")}
-
-                style={{
-                  ...secondaryButton,
-
-                  border:
-                    searchMode === "json"
-                      ? "2px solid #303030"
-                      : "1px solid #c9c9c9",
-                }}
-              >
-                Search by JSON
-              </button>
+                <button
+                  type="button"
+                  className="ymmt-search-method"
+                  aria-pressed={searchMode === "manual"}
+                  disabled={searchBusy}
+                  onClick={() => switchSearchMode("manual")}
+                >
+                  <svg
+                    width="17"
+                    height="17"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    aria-hidden="true"
+                    style={{ flexShrink: 0 }}
+                  >
+                    <circle cx="10.5" cy="10.5" r="6.5" />
+                    <path d="m16 16 4.5 4.5" />
+                  </svg>
+                  Manual Search
+                </button>
+                <button
+                  type="button"
+                  className="ymmt-search-method"
+                  aria-pressed={searchMode === "json"}
+                  disabled={searchBusy}
+                  onClick={() => switchSearchMode("json")}
+                >
+                  <svg
+                    width="17"
+                    height="17"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.8"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                    style={{ flexShrink: 0 }}
+                  >
+                    <path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9l-6-6Z" />
+                    <path d="M14 3v6h6M10 12l-2 2 2 2m4-4 2 2-2 2" />
+                  </svg>
+                  Search by JSON
+                </button>
+              </div>
             </div>
 
             {/* =============================================
@@ -2747,11 +3086,11 @@ function StatCard({ label, value }) {
   return (
     <div
       style={{
-        padding: "15px",
+        padding: "16px",
 
         border: "1px solid #e3e3e3",
 
-        borderRadius: "10px",
+        borderRadius: "12px",
 
         background: "#ffffff",
       }}
@@ -2760,7 +3099,7 @@ function StatCard({ label, value }) {
         style={{
           color: "#616161",
 
-          fontSize: "12px",
+          fontSize: "13px",
         }}
       >
         {label}
@@ -2768,9 +3107,9 @@ function StatCard({ label, value }) {
 
       <div
         style={{
-          marginTop: "5px",
+          marginTop: "6px",
 
-          fontSize: "24px",
+          fontSize: "26px",
 
           fontWeight: "700",
         }}

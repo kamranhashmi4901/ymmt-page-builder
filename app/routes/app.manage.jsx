@@ -7,6 +7,7 @@ import {
   useFetcher,
   useLoaderData,
   useNavigation,
+  useNavigate,
 } from "react-router";
 
 import { authenticate } from "../shopify.server";
@@ -900,6 +901,7 @@ const initialManageSummary = {
 };
 
 export default function ManagePages() {
+  const navigate = useNavigate();
   const {
     shop,
     summaryUrl,
@@ -1274,6 +1276,39 @@ export default function ManagePages() {
 
   return (
     <s-page heading="Manage YMMT Pages">
+      <s-section>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            flexWrap: "wrap",
+            gap: "12px",
+          }}
+        >
+          <div>
+            <strong>Page maintenance</strong>
+            <p style={{ marginBottom: 0, color: "#616161" }}>
+              Scan all products and pages, review missing values, export a
+              report, and apply verified corrections.
+            </p>
+          </div>
+          <Link
+            to="/app/manage-repair"
+            style={{
+              display: "inline-block",
+              padding: "10px 16px",
+              borderRadius: "8px",
+              background: "#303030",
+              color: "white",
+              textDecoration: "none",
+              fontWeight: 650,
+            }}
+          >
+            Update missing values in all pages
+          </Link>
+        </div>
+      </s-section>
       <style>
         {`
 
@@ -2265,6 +2300,15 @@ export default function ManagePages() {
                 description="Rebuild the page body using its YMMT vehicle data."
 
                 onClick={() => setSelectedAction("update-content")}
+              />
+
+              <ActionCard
+                selected={false}
+                title="Update missing values in all pages"
+                description="Scan, review, export, and correct missing YMMT values across all pages."
+                onClick={() => {
+                  navigate("/app/manage-repair");
+                }}
               />
 
               <ActionCard

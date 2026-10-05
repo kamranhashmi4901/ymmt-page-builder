@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   Form,
@@ -40,91 +40,6 @@ import {
   startYMMTPageSearchJob,
 } from "../lib/ymmt-page-search-jobs.server";
 
-// Fetch one bounded batch; never scan the whole store during navigation.
-const MANAGE_STATS_QUERY = `#graphql
-  query ManagePageStatistics($after: String) {
-    pages(first: 100, after: $after) {
-      nodes {
-        isPublished templateSuffix
-      }
-      pageInfo { hasNextPage endCursor }
-    }
-  }
-`;
-
-function throttleDelay(json, attempt) {
-  const cost = json?.extensions?.cost;
-  const status = cost?.throttleStatus;
-  const seconds =
-    status?.restoreRate > 0
-      ? Math.max(
-          0,
-          (cost.requestedQueryCost - status.currentlyAvailable) /
-            status.restoreRate,
-        )
-      : 0;
-  return Math.min(
-    5000,
-    Math.max(1000 * (attempt + 1), Math.ceil(seconds * 1000) + 250),
-  );
-}
-
-async function getManageStatsBatch(admin, after = null) {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    let json;
-    try {
-      const response = await admin.graphql(MANAGE_STATS_QUERY, {
-        variables: { after },
-      });
-      json = await response.json();
-      if (response.status === 429 && !json.errors?.length) {
-        json.errors = [
-          {
-            message: "Shopify is busy. Please try again.",
-            extensions: { code: "THROTTLED" },
-          },
-        ];
-      }
-    } catch (error) {
-      // Shopify's SDK can throw GraphqlQueryError before response.json().
-      const body = error.body;
-      const errors = Array.isArray(body?.errors)
-        ? body.errors
-        : body?.errors?.graphQLErrors;
-      if (errors?.length) json = { ...body, errors };
-      else if (error.response?.code === 429 || error.response?.status === 429) {
-        json = {
-          errors: [{ message: "Throttled", extensions: { code: "THROTTLED" } }],
-        };
-      } else throw error;
-    }
-    if (json.errors?.length) {
-      const throttled = json.errors.every(
-        (error) => error.extensions?.code === "THROTTLED",
-      );
-      if (throttled && attempt < 4) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, throttleDelay(json, attempt)),
-        );
-        continue;
-      }
-      throw new Error(json.errors.map((error) => error.message).join(", "));
-    }
-    const connection = json.data?.pages;
-    if (!Array.isArray(connection?.nodes) || !connection.pageInfo) {
-      throw new Error("Shopify did not return a valid pages response.");
-    }
-    if (
-      connection.pageInfo.hasNextPage &&
-      (!connection.pageInfo.endCursor ||
-        connection.pageInfo.endCursor === after)
-    ) {
-      throw new Error("Shopify returned an invalid pagination cursor.");
-    }
-    return connection;
-  }
-}
-
 /* =========================================================
    LOADER
 ========================================================= */
@@ -133,41 +48,6 @@ export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
 
   const url = new URL(request.url);
-
-  if (url.searchParams.get("_manageSummary") === "1") {
-    const after = url.searchParams.get("after") || null;
-    const scan = url.searchParams.get("scan") || "";
-    try {
-      const connection = await getManageStatsBatch(admin, after);
-      const ymmtPages = connection.nodes.filter(
-        (page) => page.templateSuffix === "product-ymmt",
-      );
-      const publishedCount = ymmtPages.filter(
-        (page) => page.isPublished,
-      ).length;
-      return {
-        scan,
-        batchKey: after || "START",
-        scanned: connection.nodes.length,
-        totalPages: ymmtPages.length,
-        publishedCount,
-        draftCount: ymmtPages.length - publishedCount,
-        hasNextPage: connection.pageInfo.hasNextPage,
-        nextCursor: connection.pageInfo.endCursor,
-      };
-    } catch (error) {
-      console.error("Manage page statistics error:", error);
-      return {
-        scan,
-        error:
-          "Unable to load page statistics. Check the server logs, then retry.",
-      };
-    }
-  }
-  const summaryUrl = new URL(request.url);
-  summaryUrl.searchParams.set("_manageSummary", "1");
-  summaryUrl.searchParams.delete("after");
-  summaryUrl.searchParams.delete("scan");
 
   const filters = {
     search: url.searchParams.get("search") || "",
@@ -211,7 +91,6 @@ export const loader = async ({ request }) => {
 
   return {
     shop: session.shop,
-    summaryUrl: `${summaryUrl.pathname}${summaryUrl.search}`,
     pages,
     filters,
     recentSessions,
@@ -891,20 +770,10 @@ const cellStyle = {
    COMPONENT
 ========================================================= */
 
-const initialManageSummary = {
-  totalPages: 0,
-  publishedCount: 0,
-  draftCount: 0,
-  scanned: 0,
-  complete: false,
-  error: "",
-};
-
 export default function ManagePages() {
   const navigate = useNavigate();
   const {
     shop,
-    summaryUrl,
     pages,
     filters,
     recentSessions,
@@ -915,68 +784,6 @@ export default function ManagePages() {
   const actionData = useActionData();
 
   const navigation = useNavigation();
-
-  const {
-    load: loadStatistics,
-    data: statisticsData,
-    state: statisticsState,
-  } = useFetcher();
-  const [pageSummary, setPageSummary] = useState(initialManageSummary);
-  const statisticsScanRef = useRef(0);
-  const statisticsProcessedRef = useRef(new Set());
-  const statisticsStartedRef = useRef("");
-
-  const loadStatisticsBatch = useCallback(
-    (after, scan) => {
-      const url = new URL(summaryUrl, window.location.origin);
-      url.searchParams.set("scan", String(scan));
-      if (after) url.searchParams.set("after", after);
-      else url.searchParams.delete("after");
-      loadStatistics(`${url.pathname}${url.search}`);
-    },
-    [loadStatistics, summaryUrl],
-  );
-
-  const refreshStatistics = useCallback(() => {
-    statisticsScanRef.current += 1;
-    statisticsProcessedRef.current = new Set();
-    setPageSummary({ ...initialManageSummary });
-    loadStatisticsBatch(null, statisticsScanRef.current);
-  }, [loadStatisticsBatch]);
-
-  useEffect(() => {
-    if (statisticsStartedRef.current === shop) return;
-    statisticsStartedRef.current = shop;
-    refreshStatistics();
-  }, [shop, refreshStatistics]);
-
-  useEffect(() => {
-    if (
-      statisticsState !== "idle" ||
-      !statisticsData ||
-      statisticsData.scan !== String(statisticsScanRef.current)
-    )
-      return;
-    if (statisticsData.error) {
-      setPageSummary((previous) => ({
-        ...previous,
-        error: statisticsData.error,
-      }));
-      return;
-    }
-    if (statisticsProcessedRef.current.has(statisticsData.batchKey)) return;
-    statisticsProcessedRef.current.add(statisticsData.batchKey);
-    setPageSummary((previous) => ({
-      totalPages: previous.totalPages + statisticsData.totalPages,
-      publishedCount: previous.publishedCount + statisticsData.publishedCount,
-      scanned: previous.scanned + statisticsData.scanned,
-      draftCount: previous.draftCount + statisticsData.draftCount,
-      complete: !statisticsData.hasNextPage,
-      error: "",
-    }));
-    if (statisticsData.hasNextPage)
-      loadStatisticsBatch(statisticsData.nextCursor, statisticsScanRef.current);
-  }, [statisticsData, statisticsState, loadStatisticsBatch]);
 
   const manualSearchFetcher = useFetcher();
   const jsonSearchFetcher = useFetcher();
@@ -1277,48 +1084,14 @@ export default function ManagePages() {
   return (
     <s-page heading="Manage YMMT Pages">
       <s-section>
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            flexWrap: "wrap",
-            gap: "12px",
-          }}
-        >
-          <div>
-            <strong>Page maintenance</strong>
-            <p style={{ marginBottom: 0, color: "#616161" }}>
-              Scan all products and pages, review missing values, export a
-              report, and apply verified corrections.
-            </p>
-          </div>
-          <Link
-            to="/app/manage-repair"
-            style={{
-              display: "inline-block",
-              padding: "10px 16px",
-              borderRadius: "8px",
-              background: "#303030",
-              color: "white",
-              textDecoration: "none",
-              fontWeight: 650,
-            }}
-          >
-            Update missing values in all pages
-          </Link>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "12px" }}>
+          <div><strong>Page maintenance</strong><p style={{ marginBottom: 0, color: "#616161" }}>Scan pages for missing or incorrect values and export affected pages as CSV or JSON.</p></div>
+          <Link to="/app/scan-pages" style={{ display: "inline-block", padding: "10px 16px", borderRadius: "8px", background: "#303030", color: "white", textDecoration: "none", fontWeight: 650 }}>Scan Pages</Link>
         </div>
       </s-section>
       <style>
         {`
 
-          .ymmt-total-toolbar {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 12px;
-            flex-wrap: wrap;
-          }
           .ymmt-search-toolbar {
             display: flex;
             align-items: center;
@@ -1387,63 +1160,6 @@ export default function ManagePages() {
           gap: "18px",
         }}
       >
-        {/* Store-wide YMMT page statistics, loaded in bounded background batches. */}
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
-            gap: "12px",
-          }}
-        >
-          <StatCard
-            label="Total YMMT Pages"
-            value={
-              !pageSummary.complete && pageSummary.scanned === 0
-                ? "…"
-                : pageSummary.totalPages
-            }
-          />
-          <StatCard
-            label="Published"
-            value={
-              !pageSummary.complete && pageSummary.scanned === 0
-                ? "…"
-                : pageSummary.publishedCount
-            }
-          />
-          <StatCard
-            label="Drafts"
-            value={
-              !pageSummary.complete && pageSummary.scanned === 0
-                ? "…"
-                : pageSummary.draftCount
-            }
-          />
-        </div>
-        <div
-          className="ymmt-total-toolbar"
-          aria-live="polite"
-          style={{
-            fontSize: "13px",
-            color: pageSummary.error ? "#b42318" : "#616161",
-          }}
-        >
-          <span>
-            {pageSummary.error ||
-              (pageSummary.complete
-                ? "Totals include all pages using the product-ymmt template, across every year."
-                : `Loading page totals… ${pageSummary.scanned} Shopify pages checked. Counts are provisional until complete.`)}
-          </span>
-          <button
-            type="button"
-            disabled={statisticsState !== "idle"}
-            onClick={refreshStatistics}
-            style={{ ...secondaryButton, flexShrink: 0 }}
-          >
-            {pageSummary.error ? "Retry" : "Refresh totals"}
-          </button>
-        </div>
-
         {/* =================================================
             STEP 1 SEARCH
         ================================================= */}
@@ -2304,11 +2020,9 @@ export default function ManagePages() {
 
               <ActionCard
                 selected={false}
-                title="Update missing values in all pages"
-                description="Scan, review, export, and correct missing YMMT values across all pages."
-                onClick={() => {
-                  navigate("/app/manage-repair");
-                }}
+                title="Scan Pages"
+                description="Scan YMMT pages and export pages with missing or incorrect values."
+                onClick={() => { navigate("/app/scan-pages"); }}
               />
 
               <ActionCard

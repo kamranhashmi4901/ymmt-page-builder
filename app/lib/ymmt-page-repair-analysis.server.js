@@ -67,6 +67,8 @@ export function isYMMTPage(page) {
 }
 
 export function analysePage(page, products, shop) {
+  const catalogKnown = Array.isArray(products);
+  products = products || [];
   const catalog = new Map(products.map((product) => [product.handle, product]));
   const issues = []; const unresolved = []; const changes = []; const evidence = [];
   if (page.templateSuffix !== "product-ymmt") {
@@ -106,18 +108,27 @@ export function analysePage(page, products, shop) {
   for (const key of required) if (!normalized[key]) unresolved.push(`Cannot verify ${key} from the page's existing data.`);
 
   const handles = [page.productHandle?.value, page.sourceProductHandle?.value].map(text);
-  const valid = [...new Set(handles.filter((handle) => catalog.has(handle)))];
+  const handleFormat = (handle) => /^[a-z0-9][a-z0-9-]*$/.test(handle);
+  const usable = (handle) => catalogKnown ? catalog.has(handle) : handleFormat(handle);
+  const valid = [...new Set(handles.filter(usable))];
   const suffix = products.filter((p) => page.handle?.endsWith(`-${p.handle}`));
+  const contentHandles = [...String(page.body || "").matchAll(/(?:href|data-product-url)\s*=\s*["'](?:https?:\/\/[^/"']+)?\/products\/([a-z0-9-]+)(?=[\/\?\#"'])/gi)].map((match) => match[1]);
+  const slug = (value) => text(value).normalize("NFKD").replace(/[\u0300-\u036f]/g, "").toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const vehicleParts = [normalized.year, normalized.make, normalized.model];
+  const prefixes = vehicleParts.every(Boolean) ? [vehicleParts, [...vehicleParts, normalized.trim]].map((parts) => parts.filter(Boolean).map(slug).join("-")).sort((a, b) => b.length - a.length) : [];
+  const prefix = prefixes.find((value) => page.handle?.startsWith(`${value}-`));
+  const inferredHandle = prefix ? page.handle.slice(prefix.length + 1) : "";
+  const pageCandidates = [...new Set([...contentHandles, ...(handleFormat(inferredHandle) ? [inferredHandle] : [])])];
   // A longer handle is more specific, but overlapping matches can be ambiguous.
-  const candidate = valid.length === 1 ? valid[0] : valid.length === 0 && suffix.length === 1 ? suffix[0].handle : "";
+  const candidate = valid.length === 1 ? valid[0] : valid.length === 0 && (catalogKnown ? suffix.length === 1 : pageCandidates.length === 1) ? (catalogKnown ? suffix[0].handle : pageCandidates[0]) : "";
   for (let index = 0; index < handles.length; index++) {
-    if (catalog.has(handles[index])) continue;
+    if (usable(handles[index])) continue;
     const key = index === 0 ? "product_handle" : "source_product_handle";
-    issues.push(`ymmt.${key}${handles[index] ? " (product not found)" : " (missing)"}`);
+    issues.push(`ymmt.${key}${handles[index] ? catalogKnown ? " (product not found)" : " (invalid handle format)" : " (missing)"}`);
     if (candidate) {
       const meta = index === 0 ? page.productHandle : page.sourceProductHandle;
       changes.push({ field: `ymmt.${key}`, type: meta?.type || "single_line_text_field", value: candidate });
-      evidence.push(`${key}: ${valid.length ? "existing valid product link" : "exact page-handle suffix"}`);
+      evidence.push(`${key}: ${valid.length ? "existing product handle" : "page content or vehicle-prefix suffix"}${catalogKnown ? " (catalog verified)" : " (product existence checked only before applying)"}`);
     } else unresolved.push(`No unique verified product match for ymmt.${key}.`);
   }
 
@@ -144,7 +155,7 @@ export function analysePage(page, products, shop) {
     }
     for (const block of [...records].reverse()) {
       const value = { ...block.value }; let blockChanged = false;
-      for (const key of ["year", "make", "model", "trim", "compat", "warning", "manufacturer"]) {
+      for (const key of ["year", "make", "model", "trim", "compat", "warning"]) {
         if (text(value[key])) continue;
         if (!["year", "make", "model", "compat"].includes(key) && !normalized[key]) continue;
         issues.push(`page.body.${block.name}.${key}`);
@@ -178,5 +189,10 @@ export function analysePage(page, products, shop) {
     changes, evidence: [...new Set(evidence)],
     current: { productHandle: handles[0], sourceProductHandle: handles[1], vehicle: page.vehicle?.value || "" },
     proposedProduct: candidate, repairable: changes.length > 0,
+    productValidation: catalogKnown ? "Catalog scanned" : "Handle format only; existing product existence is not checked during this page-only scan",
+    exportVehicle: {
+      year: normalized.year, make: normalized.make, model: normalized.model, trim: normalized.trim || "",
+      Warning: normalized.warning || "", Compatible: normalized.compat || "", Manufacturer: normalized.manufacturer || "",
+    },
   };
 }

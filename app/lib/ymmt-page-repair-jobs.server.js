@@ -7,7 +7,6 @@ const PAGE_FIELDS = `id title handle body templateSuffix isPublished
   vehicle: metafield(namespace: "ymmt", key: "vehicle") { id type value }
   productHandle: metafield(namespace: "ymmt", key: "product_handle") { id type value }
   sourceProductHandle: metafield(namespace: "ymmt", key: "source_product_handle") { id type value }`;
-const PRODUCTS = `#graphql\nquery RepairProducts($after: String) { products(first: 100, after: $after) { nodes { id title handle status } pageInfo { hasNextPage endCursor } } }`;
 const PAGES = `#graphql\nquery RepairPages($after: String) { pages(first: 25, after: $after) { nodes { ${PAGE_FIELDS} } pageInfo { hasNextPage endCursor } } }`;
 const PAGE = `#graphql\nquery RepairPage($id: ID!) { page(id: $id) { ${PAGE_FIELDS} } }`;
 const PRODUCT = `#graphql\nquery RepairProduct($handle: String!) { productByHandle(handle: $handle) { id handle } }`;
@@ -88,13 +87,13 @@ export async function createRepairJob(shop) {
     const current = await latestRepairJob(shop);
     if (current && !["done"].includes(current.phase)) return current;
     const job = {
-      id: randomUUID(), shop, token: randomBytes(32).toString("hex"), phase: "products", status: "paused", error: "",
+      id: randomUUID(), shop, token: randomBytes(32).toString("hex"), workflowVersion: 2, phase: "pages", status: "paused", error: "",
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), scanComplete: false, endedEarly: false,
       productCursor: null, pageCursor: null, seenProductCursors: [], seenPageCursors: [],
       productsScanned: 0, pagesScanned: 0, ymmtPages: 0, completePages: 0, affectedPages: 0, repairablePages: 0,
       requestCount: 0, catalogKey: null, batches: [], results: {}, fixBatch: 0, fixRow: 0, logs: [],
     };
-    addLog(job, "info", "Ready to scan products. No Shopify records have been changed.");
+    addLog(job, "info", "Ready to scan pages. No product catalog scan or Shopify changes have started.");
     await writeRepairJson(metaKey(shop, job.id), job, { IfNoneMatch: "*" });
     await writeRepairJson(`${repairPrefix(shop)}/latest.json`, { id: job.id }); return job;
   });
@@ -152,7 +151,7 @@ async function repairOne(admin, row, products, job, assertOwner) {
   if (!row.changes.length) return { status: "unresolved", message: row.unresolved.join(" ") || "No verified correction available.", fields: [] };
   for (const handle of [...new Set(row.changes.filter((change) => /product_handle$/.test(change.field)).map((change) => change.value))]) {
     const check = await repairGraphql(admin, PRODUCT, { handle }, job, assertOwner);
-    if (!check.productByHandle || check.productByHandle.id !== products.find((p) => p.handle === handle)?.id) return { status: "changed", message: `Product ${handle} changed or was removed. Run a new scan.`, fields: [] };
+    if (!check.productByHandle || (Array.isArray(products) && check.productByHandle.id !== products.find((p) => p.handle === handle)?.id)) return { status: "changed", message: `Product ${handle} changed or was removed. Run a new scan.`, fields: [] };
   }
   // Save a complete before-image before sending a mutation. This backup survives
   // retries and can be used for recovery; no automatic rollback overwrites edits.
@@ -195,10 +194,6 @@ export async function advanceRepairJob(shop, id, admin, intent = "advance") {
       etag = await writeRepairJson(metaKey(shop, id), job, { IfMatch: etag }); committed = structuredClone(job);
     }
     try {
-      if (intent === "pages") {
-        if (job.phase !== "products_done") throw new Error("Finish the product scan first.");
-        job.phase = "pages"; addLog(job, "info", "Page scan started. Products and pages remain unchanged."); await save(); return job;
-      }
       if (intent === "correct") {
         if (job.phase !== "review") throw new Error("Finish scanning and review the report first.");
         job.phase = "correcting"; addLog(job, "info", "Applying verified corrections. Before-images are saved in R2."); await save(); return job;
@@ -214,26 +209,21 @@ export async function advanceRepairJob(shop, id, admin, intent = "advance") {
         job.phase = "done"; addLog(job, "info", job.endedEarly ? "Session ended before completion. Retained reports are partial; start a new scan if needed." : "Session finalized. CSV reports remain available."); await save(); return job;
       }
       if (intent !== "advance") throw new Error("Unknown repair action.");
-      const catalog = job.catalogKey ? (await readRepairJson(job.catalogKey))?.value : [];
-      if (!Array.isArray(catalog)) throw new Error("The saved product catalog is missing. Start a new scan.");
-      if (job.phase === "products") {
-        const data = await repairGraphql(admin, PRODUCTS, { after: job.productCursor }, job, assertOwner);
-        const batch = connection(data.products, "products");
-        const byId = new Map(catalog.map((p) => [p.id, p]));
-        for (const product of batch.nodes) byId.set(product.id, product);
-        const oldKey = job.catalogKey;
-        job.catalogKey = await uniqueRepairJson(`${prefix}/catalog`, [...byId.values()]);
-        job.productsScanned = byId.size;
-        if (!nextCursor(job, batch, "product")) job.phase = "products_done";
-        addLog(job, "success", `Products scanned: ${job.productsScanned}. ${job.phase === "products_done" ? "Product scan complete." : "Checkpoint saved."}`);
-        await save(); await removeRepairObject(oldKey);
-      } else if (job.phase === "pages") {
+      // New page-only sessions do not read or scan a product catalog.
+      if (["products", "products_done"].includes(job.phase)) {
+        job.phase = "pages"; job.workflowVersion = 2;
+        addLog(job, "info", "Old product-scan step skipped. Scanning pages directly.");
+        await save(); return job;
+      }
+      const catalog = job.workflowVersion === 2 ? null : job.catalogKey ? (await readRepairJson(job.catalogKey))?.value : [];
+      if (job.workflowVersion !== 2 && !Array.isArray(catalog)) throw new Error("The saved product catalog is missing. End this session and start a new scan.");
+      if (job.phase === "pages") {
         const data = await repairGraphql(admin, PAGES, { after: job.pageCursor }, job, assertOwner);
         const batch = connection(data.pages, "pages"); const rows = [];
         for (const page of batch.nodes) {
           job.pagesScanned++;
           if (!isYMMTPage(page)) continue;
-          job.ymmtPages++; const row = analysePage(page, catalog, shop);
+          job.ymmtPages++; const row = analysePage(page, job.workflowVersion === 2 ? null : catalog, shop);
           if (!row.issues.length) job.completePages++;
           else { rows.push(row); job.affectedPages++; if (row.repairable) job.repairablePages++; }
         }
@@ -310,7 +300,7 @@ export async function repairView(job, origin, offset = 0) {
   url.searchParams.set("shop", job.shop); url.searchParams.set("job", job.id); url.searchParams.set("token", job.token);
   return {
     id: job.id, phase: job.phase, status: job.status, error: job.error, updatedAt: job.updatedAt, scanComplete: job.scanComplete, endedEarly: job.endedEarly,
-    productsScanned: job.productsScanned, pagesScanned: job.pagesScanned, ymmtPages: job.ymmtPages,
+    workflowVersion: job.workflowVersion || 1, pagesScanned: job.pagesScanned, ymmtPages: job.ymmtPages,
     completePages: job.completePages, affectedPages: job.affectedPages, repairablePages: job.repairablePages,
     requestCount: job.requestCount, logs: job.logs, counts: repairCounts(job), rows, offset,
     repairProcessed: Object.values(repairCounts(job)).reduce((sum, count) => sum + count, 0),
@@ -328,7 +318,7 @@ export async function downloadRepairCsv(request) {
   const token = url.searchParams.get("token") || "";
   if (!job || !/^[0-9a-f]{64}$/.test(token) || !/^[0-9a-f]{64}$/.test(job.token || "") || !timingSafeEqual(Buffer.from(token, "hex"), Buffer.from(job.token, "hex"))) return new Response("Report not found.", { status: 404 });
   if (!["review", "correcting", "results", "done"].includes(job.phase)) return new Response("Finish the page scan before exporting.", { status: 409 });
-  const columns = ["audit_status", "page_id", "title", "handle", "page_url", "admin_url", "missing_or_invalid_fields", "current_product_handle", "current_source_product_handle", "current_vehicle_json", "proposed_product_handle", "proposed_fields", "proposed_values_json", "evidence", "unresolved_issues", "result", "result_message", "updated_fields", "result_time"];
+  const columns = ["audit_status", "page_id", "title", "handle", "page_url", "admin_url", "missing_or_invalid_fields", "current_product_handle", "current_source_product_handle", "current_vehicle_json", "proposed_product_handle", "proposed_fields", "proposed_values_json", "evidence", "unresolved_issues", "result", "result_message", "updated_fields", "result_time", "product_validation"];
   async function* lines() {
     yield "\uFEFF" + columns.map(csv).join(",") + "\r\n";
     for (let i = 0; i < job.batches.length; i++) {
@@ -338,7 +328,7 @@ export async function downloadRepairCsv(request) {
       for (const row of rows) {
         const result = results[row.id];
         const proposed = Object.fromEntries(row.changes.map((change) => [change.field, change.field === "page.body" ? "Repair existing embedded JSON or rebuild empty body" : change.value]));
-        yield [job.scanComplete ? "complete scan" : "incomplete scan", row.id, row.title, row.handle, row.url, row.adminUrl, row.issues.join("; "), row.current.productHandle, row.current.sourceProductHandle, row.current.vehicle, row.proposedProduct, row.changes.map((c) => c.field).join("; "), JSON.stringify(proposed), row.evidence.join("; "), row.unresolved.join("; "), result?.status || "pending", result?.message || "", result?.fields.join("; ") || "", result?.time || ""].map(csv).join(",") + "\r\n";
+        yield [job.scanComplete ? "complete scan" : "incomplete scan", row.id, row.title, row.handle, row.url, row.adminUrl, row.issues.join("; "), row.current.productHandle, row.current.sourceProductHandle, row.current.vehicle, row.proposedProduct, row.changes.map((c) => c.field).join("; "), JSON.stringify(proposed), row.evidence.join("; "), row.unresolved.join("; "), result?.status || "pending", result?.message || "", result?.fields.join("; ") || "", result?.time || "", row.productValidation || "Catalog scanned"].map(csv).join(",") + "\r\n";
       }
     }
   }

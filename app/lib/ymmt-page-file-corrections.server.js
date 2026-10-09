@@ -13,8 +13,10 @@ const PAGE_FIELDS = `id title handle body templateSuffix isPublished
 vehicle: metafield(namespace: "ymmt", key: "vehicle") { id type value }
 productHandle: metafield(namespace: "ymmt", key: "product_handle") { id type value }
 sourceProductHandle: metafield(namespace: "ymmt", key: "source_product_handle") { id type value }`;
-const QUERY = `#graphql query CheckSavedPageIDs($ids: [ID!]!) { nodes(ids: $ids) { ... on Page { ${PAGE_FIELDS} } } }`;
-const UPDATE = `#graphql mutation CorrectSavedPage($id: ID!, $page: PageUpdateInput!) { pageUpdate(id: $id, page: $page) { page { id } userErrors { field message } } }`;
+const QUERY = `#graphql
+query CheckSavedPageIDs($ids: [ID!]!) { nodes(ids: $ids) { ... on Page { ${PAGE_FIELDS} } } }`;
+const UPDATE = `#graphql
+mutation CorrectSavedPage($id: ID!, $page: PageUpdateInput!) { pageUpdate(id: $id, page: $page) { page { id } userErrors { field message } } }`;
 const planCache = new Map();
 export async function fileCorrectionUploadStatus(shop) {
   const lock = await readRepairJson(`${prefix(shop)}/create-lock.json`);
@@ -58,7 +60,7 @@ export function parseCsv(text) {
 export function correctionPlan(csvText, jsonText) {
   const json = JSON.parse(jsonText); const index = new Map();
   const object = (v) => v && typeof v === "object" && !Array.isArray(v);
-  if (!object(json)) throw new Error("Expected a Year → Make → Model → Trim JSON object.");
+  if (!object(json)) throw new Error("Expected a Year â†’ Make â†’ Model â†’ Trim JSON object.");
   function add(key, leaf) {
     if (!object(leaf) || fields.some((f) => typeof leaf[f] !== "string" || !leaf[f].trim())) throw new Error(`Incomplete corrected values for ${key.join(" / ")}.`);
     index.set(JSON.stringify(key), { ...Object.fromEntries(coordinates.map((k, i) => [k, key[i]])), compatible: leaf.Compatible, compat: leaf.Compatible, warning: leaf.Warning, manufacturer: leaf.Manufacturer });
@@ -82,7 +84,7 @@ export function correctionPlan(csvText, jsonText) {
     if (row.correction_status === "verified" && !target) throw new Error(`The corrected JSON has no exact vehicle match for ${row.handle}.`);
     return { id: row.page_id, handle: row.handle, target: target || null, reason: target ? "" : "Vehicle match needs manual review; no automatic correction." };
   });
-  if (!rows.length || rows.length > 60000) throw new Error("CSV must contain 1–60,000 pages.");
+  if (!rows.length || rows.length > 60000) throw new Error("CSV must contain 1â€“60,000 pages.");
   return rows;
 }
 
@@ -207,7 +209,7 @@ export async function advanceFileCorrectionJob(shop, id, admin, intent = "advanc
           }
           if (receipt.result === "failed") { job.failed--; job.processed--; }
           receipts[row.id] = { ...receipt, result, message }; job[result]++; job.processed++;
-          log(job, result === "failed" ? "error" : "info", `${row.handle}: ${result}${message ? ` — ${message}` : ""}`);
+          log(job, result === "failed" ? "error" : "info", `${row.handle}: ${result}${message ? ` â€” ${message}` : ""}`);
           await persistResults();
         }
       }

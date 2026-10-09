@@ -16,6 +16,10 @@ sourceProductHandle: metafield(namespace: "ymmt", key: "source_product_handle") 
 const QUERY = `#graphql query CheckSavedPageIDs($ids: [ID!]!) { nodes(ids: $ids) { ... on Page { ${PAGE_FIELDS} } } }`;
 const UPDATE = `#graphql mutation CorrectSavedPage($id: ID!, $page: PageUpdateInput!) { pageUpdate(id: $id, page: $page) { page { id } userErrors { field message } } }`;
 const planCache = new Map();
+export async function fileCorrectionUploadStatus(shop) {
+  const lock = await readRepairJson(`${prefix(shop)}/create-lock.json`);
+  return { busy: Boolean(lock?.value.until > Date.now()), lockUntil: lock?.value.until || 0 };
+}
 async function planRows(batch) {
   if (typeof batch === "string") return (await readRepairJson(batch))?.value;
   let rows = planCache.get(batch.key);

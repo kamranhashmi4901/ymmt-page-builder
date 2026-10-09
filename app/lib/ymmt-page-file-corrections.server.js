@@ -15,6 +15,21 @@ productHandle: metafield(namespace: "ymmt", key: "product_handle") { id type val
 sourceProductHandle: metafield(namespace: "ymmt", key: "source_product_handle") { id type value }`;
 const QUERY = `#graphql query CheckSavedPageIDs($ids: [ID!]!) { nodes(ids: $ids) { ... on Page { ${PAGE_FIELDS} } } }`;
 const UPDATE = `#graphql mutation CorrectSavedPage($id: ID!, $page: PageUpdateInput!) { pageUpdate(id: $id, page: $page) { page { id } userErrors { field message } } }`;
+const planCache = new Map();
+async function planRows(batch) {
+  if (typeof batch === "string") return (await readRepairJson(batch))?.value;
+  let rows = planCache.get(batch.key);
+  if (!rows) { rows = (await readRepairJson(batch.key))?.value; if (!Array.isArray(rows)) throw new Error("Saved page list is missing."); planCache.set(batch.key, rows); if (planCache.size > 6) planCache.delete(planCache.keys().next().value); }
+  return rows.slice(batch.start, batch.end);
+}
+export async function fileCorrectionStatus(shop, job) {
+  if (!job) return null;
+  const key = job.phase === "uploading" ? `${prefix(shop)}/create-lock.json` : `${prefix(shop, job.id)}/batch-lock.json`;
+  const lock = await readRepairJson(key);
+  const { batches, receipts, ...summary } = job;
+  const busy = Boolean(lock?.value.until > Date.now());
+  return { ...summary, busy, ...(job.phase === "uploading" && !busy ? { phase: "upload_failed", error: "The upload was interrupted. Choose the same files and upload again." } : {}) };
+}
 
 export function parseCsv(text) {
   text = text.replace(/^\uFEFF/, "");
@@ -107,13 +122,29 @@ export async function latestFileCorrectionJob(shop) {
 }
 export async function createFileCorrectionJob(shop, csvText, jsonText) {
   const rows = correctionPlan(csvText, jsonText);
-  return withLock(`${prefix(shop)}/create-lock.json`, async () => {
+  return withLock(`${prefix(shop)}/create-lock.json`, async (owner) => {
     const current = await latestFileCorrectionJob(shop);
-    if (current && ["checking", "correcting"].includes(current.phase)) throw new Error("Finish the active check/correction before uploading another job.");
-    const job = { id: randomUUID(), shop, phase: "checking", status: "paused", error: "", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), logs: [], batches: [], receipts: {}, batch: 0, requestCount: 0, total: rows.length, checked: 0, needsCorrection: 0, correct: 0, skipped: 0, corrected: 0, unchanged: 0, changed: 0, failed: 0, processed: 0 };
-    for (let i = 0; i < rows.length; i += 10) job.batches.push(await uniqueRepairJson(`${prefix(shop, job.id)}/plans`, rows.slice(i, i + 10)));
+    // Owning the create lock means an unfinished prior upload has stopped.
+    if (current && ["checking", "correcting"].includes(current.phase)) return current;
+    const job = { id: randomUUID(), shop, phase: "uploading", status: "paused", error: "", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), logs: [], batches: [], receipts: {}, batch: 0, requestCount: 0, total: rows.length, uploaded: 0, checked: 0, needsCorrection: 0, correct: 0, skipped: 0, corrected: 0, unchanged: 0, changed: 0, failed: 0, processed: 0 };
+    log(job, "info", `Preparing ${rows.length} saved page IDs. Upload progress updates automatically.`);
+    let etag = await writeRepairJson(meta(shop, job.id), job, { IfNoneMatch: "*" });
+    await writeRepairJson(`${prefix(shop)}/latest.json`, { id: job.id });
+    try {
+      // Store up to 1,000 rows per object, while keeping Shopify batches at 10.
+      // Previously an upload wrote 2,568 objects before publishing its first log.
+      for (let i = 0; i < rows.length; i += 1000) {
+        owner();
+        const group = rows.slice(i, i + 1000); const key = await uniqueRepairJson(`${prefix(shop, job.id)}/plans`, group);
+        for (let start = 0; start < group.length; start += 10) job.batches.push({ key, start, end: Math.min(group.length, start + 10) });
+        job.uploaded += group.length; job.updatedAt = new Date().toISOString();
+        log(job, "info", `Saved upload: ${job.uploaded}/${job.total} page IDs.`);
+        owner(); etag = await writeRepairJson(meta(shop, job.id), job, { IfMatch: etag });
+      }
+    } catch (error) { owner(); job.phase = "upload_failed"; job.error = repairError(error); job.updatedAt = new Date().toISOString(); log(job, "error", `Upload failed. Choose your files again. ${job.error}`); await writeRepairJson(meta(shop, job.id), job, { IfMatch: etag }); throw error; }
+    job.phase = "checking"; job.updatedAt = new Date().toISOString();
     log(job, "info", `Loaded ${rows.length} saved page IDs. Checks use these IDs only; no whole-store or product search.`);
-    await writeRepairJson(meta(shop, job.id), job, { IfNoneMatch: "*" }); await writeRepairJson(`${prefix(shop)}/latest.json`, { id: job.id });
+    await writeRepairJson(meta(shop, job.id), job, { IfMatch: etag });
     return job;
   });
 }
@@ -133,7 +164,7 @@ export async function advanceFileCorrectionJob(shop, id, admin, intent = "advanc
         job.phase = "correcting"; job.retryFailed = true; job.batch = 0; log(job, "info", "Retrying only failed pages; completed corrections are retained."); await save(); return job;
       }
       if (intent !== "advance" || !["checking", "correcting"].includes(job.phase)) throw new Error("No active check or correction to advance.");
-      const rows = (await readRepairJson(job.batches[job.batch]))?.value;
+      const rows = await planRows(job.batches[job.batch]);
       if (!Array.isArray(rows)) throw new Error("Saved page list is missing.");
       const previous = job.receipts[job.batch];
       const receipts = previous ? (await readRepairJson(previous))?.value : {};
@@ -191,7 +222,7 @@ export async function fileCorrectionView(job, offset = 0) {
     if (!job.receipts[i]) continue;
     const data = (await readRepairJson(job.receipts[i]))?.value;
     if (!data) throw new Error("Saved check results are missing.");
-    const plans = (await readRepairJson(job.batches[i]))?.value;
+    const plans = await planRows(job.batches[i]);
     for (const p of plans) { const r = data[p.id]; if (!r || r.state === "correct") continue; if (count++ < offset) continue; rows.push({ id: p.id, handle: p.handle, adminUrl: `https://${job.shop}/admin/pages/${p.id.split("/").pop()}`, ...r }); if (rows.length === 25) break; }
     if (rows.length === 25) break;
   }

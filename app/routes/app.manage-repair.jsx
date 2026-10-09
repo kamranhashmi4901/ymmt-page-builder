@@ -1,12 +1,12 @@
 import { useEffect, useState } from "react";
 import { Link, useFetcher, useLoaderData, useRouteError } from "react-router";
 import { authenticate } from "../shopify.server";
-import { createFileCorrectionJob, getFileCorrectionJob, latestFileCorrectionJob, advanceFileCorrectionJob, fileCorrectionView } from "../lib/ymmt-page-file-corrections.server";
+import { createFileCorrectionJob, getFileCorrectionJob, latestFileCorrectionJob, advanceFileCorrectionJob, fileCorrectionView, fileCorrectionStatus } from "../lib/ymmt-page-file-corrections.server";
 import { repairError } from "../lib/ymmt-page-repair-storage.server";
 
 export const loader = async ({ request }) => {
   const { session } = await authenticate.admin(request); const url = new URL(request.url);
-  try { const job = url.searchParams.get("job") ? await getFileCorrectionJob(session.shop, url.searchParams.get("job")) : await latestFileCorrectionJob(session.shop); return { job: await fileCorrectionView(job, url.searchParams.get("offset")), error: "" }; }
+  try { const job = url.searchParams.get("job") ? await getFileCorrectionJob(session.shop, url.searchParams.get("job")) : await latestFileCorrectionJob(session.shop); if (url.searchParams.get("status") === "1") return { job: await fileCorrectionStatus(session.shop, job), error: "" }; return { job: job ? { ...await fileCorrectionView(job, url.searchParams.get("offset")), ...await fileCorrectionStatus(session.shop, job) } : null, error: "" }; }
   catch (error) { return { job: null, error: repairError(error) }; }
 };
 export const action = async ({ request }) => {
@@ -22,29 +22,44 @@ export const action = async ({ request }) => {
     } else if (["advance", "correct", "retry-failed"].includes(intent)) job = await advanceFileCorrectionJob(session.shop, String(form.get("job") || ""), admin, intent);
     else throw new Error("Unknown correction action.");
     return { job: await fileCorrectionView(job), error: "" };
-  } catch (error) { return { error: repairError(error) }; }
+  } catch (error) {
+    const message = repairError(error);
+    if (/batch is already running|Another request updated this job/i.test(message)) {
+      const job = await latestFileCorrectionJob(session.shop);
+      return { job: await fileCorrectionView(job), error: "", busy: true };
+    }
+    return { error: message };
+  }
 };
 const card = { background: "#fff", border: "1px solid #ddd", borderRadius: "12px", padding: "18px" };
 const button = { padding: "10px 16px", background: "#202020", color: "#fff", border: "none", borderRadius: "8px", fontWeight: 650, cursor: "pointer", textDecoration: "none", display: "inline-block" };
 const secondary = { ...button, background: "#fff", color: "#202020", border: "1px solid #ccc" };
 export default function CorrectPages() {
-  const loaded = useLoaderData(), worker = useFetcher(); const [auto, setAuto] = useState(false);
+  const loaded = useLoaderData(), worker = useFetcher(), poller = useFetcher(); const [auto, setAuto] = useState(false);
   const candidate = worker.data?.job;
-  const job = candidate && (!loaded.job || Date.parse(candidate.updatedAt) > Date.parse(loaded.job.updatedAt)) ? candidate : loaded.job;
+  const baseJob = candidate && (!loaded.job || Date.parse(candidate.updatedAt) > Date.parse(loaded.job.updatedAt)) ? candidate : loaded.job;
+  const polled = poller.data?.job;
+  const job = polled && (!baseJob || Date.parse(polled.updatedAt) >= Date.parse(baseJob.updatedAt)) ? { ...baseJob, ...polled, rows: baseJob?.id === polled.id ? baseJob.rows : [], offset: baseJob?.id === polled.id ? baseJob.offset : 0, issueCount: polled.needsCorrection + polled.skipped } : baseJob;
   const pending = worker.state !== "idle", active = ["checking", "correcting"].includes(job?.phase);
+  const busy = Boolean(job?.busy || (worker.data?.busy && poller.data === undefined));
   const error = worker.data?.error || loaded.error || job?.error;
   const submit = (intent) => { setAuto(true); worker.submit({ intent, job: job.id }, { method: "post", action: "/app/manage-repair" }); };
+  useEffect(() => {
+    if (!pending && !active && !busy && job?.phase !== "uploading") return;
+    const timer = setTimeout(() => { if (poller.state === "idle") poller.load(`/app/manage-repair?status=1${job?.id && !pending ? `&job=${job.id}` : ""}`); }, 2500);
+    return () => clearTimeout(timer);
+  }, [pending, active, busy, job?.id, job?.phase, poller.state, poller.data, poller.load]);
   useEffect(() => { if (worker.data?.error || job?.status === "failed" || !active) setAuto(false); }, [worker.data, job?.status, active]);
   useEffect(() => {
-    if (!auto || pending || !active || job?.status === "failed" || worker.data?.error) return;
+    if (!auto || pending || busy || !active || job?.status === "failed" || worker.data?.error) return;
     const timer = setTimeout(() => worker.submit({ intent: "advance", job: job.id }, { method: "post", action: "/app/manage-repair" }), 700);
     return () => clearTimeout(timer);
-  }, [auto, pending, active, job?.id, job?.updatedAt, job?.status, worker.data, worker.submit]);
+  }, [auto, pending, busy, active, job?.id, job?.updatedAt, job?.status, worker.data, worker.submit]);
   return <s-page heading="Correct Pages">
     <div style={{ display: "flex", flexDirection: "column", gap: "18px" }}>
       <div style={{ display: "flex", gap: "16px" }}><Link to="/app/manage">← Manage Pages</Link><Link to="/app/scan-pages">Scan Pages</Link></div>
       {error && <div role="alert" style={{ ...card, background: "#fff4f4", color: "#8a2e1b" }}>{error}</div>}
-      {(!job || !active) && <div style={card}>
+      {(!job || (!active && job.phase !== "uploading")) && <div style={card}>
         <strong>1. Upload your saved files</strong>
         <p>Upload the prepared page list and corrected vehicle data. Check Pages reads only the listed page IDs. It does not change pages.</p>
         <worker.Form method="post" action="/app/manage-repair" encType="multipart/form-data" onSubmit={() => setAuto(false)}>
@@ -56,10 +71,12 @@ export default function CorrectPages() {
       </div>}
       {job && <>
         <div style={card}>
-          <strong>{job.phase === "review" ? "2. Check complete — review the differences" : job.phase === "complete" ? "3. Correction complete" : job.phase === "correcting" ? "3. Correcting fields" : "2. Check saved pages"}</strong>
+          <strong>{job.phase === "uploading" ? "1. Saving uploaded page list" : job.phase === "review" ? "2. Check complete — review the differences" : job.phase === "complete" ? "3. Correction complete" : job.phase === "correcting" ? "3. Correcting fields" : "2. Check saved pages"}</strong>
+          {job.phase === "uploading" && <p>Saved {(job.uploaded || 0).toLocaleString()} / {job.total.toLocaleString()} page IDs. Logs refresh automatically.</p>}
+          {busy && <p role="status">A request is running. Progress and logs refresh automatically; no need to upload again.</p>}
           <p>{job.phase === "review" ? "Review the table below. Correct Fields applies verified values to the pages that need changes." : job.phase === "complete" ? "Updated pages were checked again. Failed, changed, and skipped pages still need review." : "Progress is saved after each batch. Keep this screen open to continue, or return later and resume."}</p>
           <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
-            {active && !auto && <button style={button} disabled={pending} onClick={() => submit("advance")}>{job.status === "failed" ? "Retry Current Batch" : job.phase === "checking" ? job.checked ? "Resume Check" : "Check Pages" : "Resume Corrections"}</button>}
+            {active && !auto && <button style={button} disabled={pending || busy} onClick={() => submit("advance")}>{job.status === "failed" ? "Retry Current Batch" : job.phase === "checking" ? job.checked ? "Resume Check" : "Check Pages" : "Resume Corrections"}</button>}
             {active && auto && <button style={secondary} onClick={() => setAuto(false)}>Pause after this batch</button>}
             {job.phase === "review" && job.needsCorrection > 0 && <button style={button} disabled={pending} onClick={() => submit("correct")}>Correct Fields ({job.needsCorrection.toLocaleString()} pages)</button>}
             {job.phase === "complete" && job.failed > 0 && <button style={button} disabled={pending} onClick={() => submit("retry-failed")}>Retry Failed Pages ({job.failed.toLocaleString()})</button>}

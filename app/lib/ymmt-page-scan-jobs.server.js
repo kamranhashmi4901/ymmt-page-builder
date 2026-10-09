@@ -53,7 +53,7 @@ export async function scanGraphql(admin, query, variables, job, assertOwner = ()
   }
 }
 
-async function withLock(key, work) {
+export async function withLock(key, work) {
   const previous = await readRepairJson(key);
   if (previous?.value.until > Date.now()) throw new Error("A batch is already running. Wait briefly, then refresh.");
   const owner = randomUUID(); let etag = await writeRepairJson(key, { owner, until: Date.now() + 180000 }, previous ? { IfMatch: previous.etag } : { IfNoneMatch: "*" });

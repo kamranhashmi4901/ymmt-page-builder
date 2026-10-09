@@ -46,7 +46,7 @@ export default function ScanPages() {
   return <s-page heading="Scan Pages">
     <style>{`.ymmt-scan-table {width:100%;border-collapse:collapse;font-size:13px} .ymmt-scan-table th,.ymmt-scan-table td {padding:12px;border-bottom:1px solid #e3e3e3;text-align:left;vertical-align:top} .ymmt-scan-log {background:#080808;color:#eee;border:1px solid #282828;border-radius:10px;padding:16px;max-height:380px;overflow:auto;font-family:monospace;font-size:12px;line-height:1.65;overflow-wrap:anywhere}`}</style>
     <div style={{ display: "flex", flexDirection: "column", gap: "18px" }}>
-      <Link to="/app/manage" style={{ color: "#303030" }}>← Manage Pages</Link>
+      <div style={{ display: "flex", gap: "16px" }}><Link to="/app/manage" style={{ color: "#303030" }}>← Manage Pages</Link><Link to="/app/manage-repair" style={secondary}>Correct Pages from Saved Files</Link></div>
       {error && <div role="alert" style={{ ...card, color: "#8a2e1b", background: "#fff4f4" }}>{error}</div>}
       <div style={card}>
         <strong>{!job ? "Scan for missing or incorrect page values" : job.status === "complete" ? "Scan complete" : job.status === "preparing" ? "Preparing exports" : job.status === "failed" ? "Scan needs attention" : "Page scan"}</strong>

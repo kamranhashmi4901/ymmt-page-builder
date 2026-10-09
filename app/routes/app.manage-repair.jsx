@@ -1,12 +1,19 @@
 import { useEffect, useState } from "react";
 import { Link, useFetcher, useLoaderData, useRouteError } from "react-router";
 import { authenticate } from "../shopify.server";
-import { createFileCorrectionJob, getFileCorrectionJob, latestFileCorrectionJob, advanceFileCorrectionJob, fileCorrectionView, fileCorrectionStatus } from "../lib/ymmt-page-file-corrections.server";
+import { createFileCorrectionJob, getFileCorrectionJob, latestFileCorrectionJob, advanceFileCorrectionJob, fileCorrectionView, fileCorrectionStatus, fileCorrectionUploadStatus } from "../lib/ymmt-page-file-corrections.server";
 import { repairError } from "../lib/ymmt-page-repair-storage.server";
 
 export const loader = async ({ request }) => {
   const { session } = await authenticate.admin(request); const url = new URL(request.url);
-  try { const job = url.searchParams.get("job") ? await getFileCorrectionJob(session.shop, url.searchParams.get("job")) : await latestFileCorrectionJob(session.shop); if (url.searchParams.get("status") === "1") return { job: await fileCorrectionStatus(session.shop, job), error: "" }; return { job: job ? { ...await fileCorrectionView(job, url.searchParams.get("offset")), ...await fileCorrectionStatus(session.shop, job) } : null, error: "" }; }
+  try {
+    const job = url.searchParams.get("job") ? await getFileCorrectionJob(session.shop, url.searchParams.get("job")) : await latestFileCorrectionJob(session.shop);
+    const status = await fileCorrectionStatus(session.shop, job);
+    const upload = await fileCorrectionUploadStatus(session.shop);
+    const busy = Boolean(status?.busy || upload.busy);
+    if (url.searchParams.get("status") === "1") return { job: status, busy, lockUntil: upload.lockUntil, error: "" };
+    return { job: job ? { ...await fileCorrectionView(job, url.searchParams.get("offset")), ...status } : null, busy, lockUntil: upload.lockUntil, error: "" };
+  }
   catch (error) { return { job: null, error: repairError(error) }; }
 };
 export const action = async ({ request }) => {
@@ -18,12 +25,15 @@ export const action = async ({ request }) => {
       const csv = form.get("csv"), json = form.get("json");
       if (!csv || !json || typeof csv.text !== "function" || typeof json.text !== "function") throw new Error("Choose the prepared CSV and corrected JSON files.");
       if (csv.size > 40 * 1024 * 1024 || json.size > 20 * 1024 * 1024) throw new Error("CSV limit: 40 MB. JSON limit: 20 MB.");
+      console.info("[YMMT upload] Accepted files", { shop: session.shop, csvBytes: csv.size, jsonBytes: json.size });
       job = await createFileCorrectionJob(session.shop, await csv.text(), await json.text());
+      console.info("[YMMT upload] Saved job", { job: job.id, phase: job.phase, pages: job.total });
     } else if (["advance", "correct", "retry-failed"].includes(intent)) job = await advanceFileCorrectionJob(session.shop, String(form.get("job") || ""), admin, intent);
     else throw new Error("Unknown correction action.");
     return { job: await fileCorrectionView(job), error: "" };
   } catch (error) {
     const message = repairError(error);
+    console.warn("[YMMT file job] Request did not complete", { shop: session.shop, message });
     if (/batch is already running|Another request updated this job/i.test(message)) {
       const job = await latestFileCorrectionJob(session.shop);
       return { job: await fileCorrectionView(job), error: "", busy: true };
@@ -36,13 +46,14 @@ const button = { padding: "10px 16px", background: "#202020", color: "#fff", bor
 const secondary = { ...button, background: "#fff", color: "#202020", border: "1px solid #ccc" };
 export default function CorrectPages() {
   const loaded = useLoaderData(), worker = useFetcher(), poller = useFetcher(); const [auto, setAuto] = useState(false);
+  const [uploadAttempted, setUploadAttempted] = useState(false);
   const candidate = worker.data?.job;
   const baseJob = candidate && (!loaded.job || Date.parse(candidate.updatedAt) > Date.parse(loaded.job.updatedAt)) ? candidate : loaded.job;
   const polled = poller.data?.job;
   const job = polled && (!baseJob || Date.parse(polled.updatedAt) >= Date.parse(baseJob.updatedAt)) ? { ...baseJob, ...polled, rows: baseJob?.id === polled.id ? baseJob.rows : [], offset: baseJob?.id === polled.id ? baseJob.offset : 0, issueCount: polled.needsCorrection + polled.skipped } : baseJob;
   const pending = worker.state !== "idle", active = ["checking", "correcting"].includes(job?.phase);
-  const busy = Boolean(job?.busy || (worker.data?.busy && poller.data === undefined));
-  const error = worker.data?.error || loaded.error || job?.error;
+  const busy = Boolean(poller.data?.busy ?? (job?.busy || worker.data?.busy || loaded.busy));
+  const error = worker.data?.error || poller.data?.error || loaded.error || job?.error;
   const submit = (intent) => { setAuto(true); worker.submit({ intent, job: job.id }, { method: "post", action: "/app/manage-repair" }); };
   useEffect(() => {
     if (!pending && !active && !busy && job?.phase !== "uploading") return;
@@ -59,14 +70,16 @@ export default function CorrectPages() {
     <div style={{ display: "flex", flexDirection: "column", gap: "18px" }}>
       <div style={{ display: "flex", gap: "16px" }}><Link to="/app/manage">← Manage Pages</Link><Link to="/app/scan-pages">Scan Pages</Link></div>
       {error && <div role="alert" style={{ ...card, background: "#fff4f4", color: "#8a2e1b" }}>{error}</div>}
+      {busy && !job && <div style={card} role="status"><strong>Waiting for an earlier upload request</strong><p>An upload lock is active, but no saved page list is available yet. Status refreshes automatically. Do not upload again while this request is running.</p><div style={{ background: "#080808", color: "#eee", padding: "16px", borderRadius: "8px", fontFamily: "monospace" }}>[WAITING] Checking upload status every 2.5 seconds. If the earlier request was interrupted, its lock expires automatically.</div></div>}
+      {!pending && !busy && uploadAttempted && !job && !error && <div role="alert" style={card}>The upload did not return a saved job. Check the server logs for “[YMMT upload]” or “[YMMT file job]”.<button type="button" style={secondary} onClick={() => poller.load("/app/manage-repair?status=1")}>Refresh upload status</button></div>}
       {(!job || (!active && job.phase !== "uploading")) && <div style={card}>
         <strong>1. Upload your saved files</strong>
         <p>Upload the prepared page list and corrected vehicle data. Check Pages reads only the listed page IDs. It does not change pages.</p>
-        <worker.Form method="post" action="/app/manage-repair" encType="multipart/form-data" onSubmit={() => setAuto(false)}>
+        <worker.Form method="post" action="/app/manage-repair" encType="multipart/form-data" onSubmit={() => { setAuto(false); setUploadAttempted(true); }}>
           <input type="hidden" name="intent" value="upload" />
-          <label style={{ display: "block", marginBottom: "14px" }}>Page list: ymmt-pages-to-correct.csv<br /><input name="csv" type="file" accept=".csv,text/csv" required disabled={pending} /></label>
-          <label style={{ display: "block", marginBottom: "14px" }}>Vehicle data: ymmt-affected-pages-corrected.json<br /><input name="json" type="file" accept=".json,application/json" required disabled={pending} /></label>
-          <button style={button} disabled={pending} type="submit">{pending ? "Uploading…" : "Upload Files"}</button>
+          <label style={{ display: "block", marginBottom: "14px" }}>Page list: ymmt-pages-to-correct.csv<br /><input name="csv" type="file" accept=".csv,text/csv" required disabled={pending || busy} /></label>
+          <label style={{ display: "block", marginBottom: "14px" }}>Vehicle data: ymmt-affected-pages-corrected.json<br /><input name="json" type="file" accept=".json,application/json" required disabled={pending || busy} /></label>
+          <button style={button} disabled={pending || busy} type="submit">{pending ? "Uploading…" : busy ? "Waiting for earlier upload…" : "Upload Files"}</button>
         </worker.Form>
       </div>}
       {job && <>

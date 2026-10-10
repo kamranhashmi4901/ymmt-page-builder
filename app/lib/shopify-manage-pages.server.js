@@ -1,106 +1,49 @@
-import { buildYMMTPageContent } from "./ymmt-page-content.server";
+import { proposeCorrection } from "./ymmt-page-file-corrections.server";
+import { matchManageJsonSource } from "./ymmt-manage-json-source.server";
 import { buildYMMTVehicleHandleBase } from "./ymmt-pages";
 
 /* =========================================================
    UPDATE PAGE CONTENT
 ========================================================= */
 
-export async function updateYMMTPageContent(admin, pageId) {
-  const response = await admin.graphql(
-    `#graphql
-      query GetYMMTVehicle($id: ID!) {
-        page(id: $id) {
-          id
-
-          vehicle: metafield(
-            namespace: "ymmt"
-            key: "vehicle"
-          ) {
-            value
-          }
-        }
+export async function updateYMMTPageContent(admin, pageId, { jsonSource } = {}) {
+  if (!jsonSource) throw new Error("Search using your corrected JSON before updating content.");
+  const query = `#graphql
+    query ReadManageCorrectionPage($id: ID!) {
+      page(id: $id) {
+        id title handle body templateSuffix isPublished
+        vehicle: metafield(namespace: "ymmt", key: "vehicle") { id type value }
+        productHandle: metafield(namespace: "ymmt", key: "product_handle") { value }
+        sourceProductHandle: metafield(namespace: "ymmt", key: "source_product_handle") { value }
       }
-    `,
-    {
-      variables: {
-        id: pageId,
-      },
-    },
-  );
-
-  const json = await response.json();
-
-  if (json.errors?.length) {
-    throw new Error(json.errors.map((error) => error.message).join(", "));
-  }
-
-  const page = json.data?.page;
-
-  if (!page) {
-    throw new Error(`Unable to find Shopify page ${pageId}.`);
-  }
-
-  if (!page.vehicle?.value) {
-    throw new Error("This page does not contain a ymmt.vehicle metafield.");
-  }
-
-  let record;
-
-  try {
-    record = JSON.parse(page.vehicle.value);
-  } catch {
-    throw new Error("The ymmt.vehicle metafield contains invalid JSON.");
-  }
-
-  const { pageBody } = buildYMMTPageContent(record);
-
-  const updateResponse = await admin.graphql(
-    `#graphql
-        mutation UpdateYMMTPageContent(
-          $id: ID!
-          $page: PageUpdateInput!
-        ) {
-          pageUpdate(
-            id: $id
-            page: $page
-          ) {
-            page {
-              id
-              title
-              handle
-            }
-
-            userErrors {
-              field
-              message
-            }
-          }
-        }
-      `,
-    {
-      variables: {
-        id: pageId,
-
-        page: {
-          body: pageBody,
-        },
-      },
-    },
-  );
-
-  const updateJson = await updateResponse.json();
-
-  if (updateJson.errors?.length) {
-    throw new Error(updateJson.errors.map((error) => error.message).join(", "));
-  }
-
-  const result = updateJson.data?.pageUpdate;
-
-  if (result?.userErrors?.length) {
-    throw new Error(result.userErrors.map((error) => error.message).join(", "));
-  }
-
-  return result?.page;
+    }`;
+  const fetchPage = async () => {
+    const response = await graphqlWithThrottleRetry(admin, query, { variables: { id: pageId } });
+    if (response.errors?.length) throw new Error(response.errors.map((e) => e.message).join(", "));
+    if (!response.data?.page) throw new Error(`Unable to find Shopify page ${pageId}.`);
+    return response.data.page;
+  };
+  const page = await fetchPage();
+  const target = matchManageJsonSource(page, jsonSource);
+  const row = { id: pageId, handle: page.handle, target };
+  const proposal = proposeCorrection(page, row);
+  if (proposal.blocked) throw new Error(proposal.issues.join("; "));
+  if (!proposal.changed) return page;
+  const response = await graphqlWithThrottleRetry(admin, `#graphql
+    mutation CorrectManagePageFromJSON($id: ID!, $page: PageUpdateInput!) {
+      pageUpdate(id: $id, page: $page) {
+        page { id title handle }
+        userErrors { field message }
+      }
+    }`, { variables: { id: pageId, page: proposal.input } });
+  if (response.errors?.length) throw new Error(response.errors.map((e) => e.message).join(", "));
+  const result = response.data?.pageUpdate;
+  if (result?.userErrors?.length) throw new Error(result.userErrors.map((e) => e.message).join(", "));
+  if (result?.page?.id !== pageId) throw new Error("Shopify did not confirm the page update.");
+  const after = await fetchPage();
+  const verified = proposeCorrection(after, row);
+  if (verified.blocked || verified.changed || after.productHandle?.value !== page.productHandle?.value || after.sourceProductHandle?.value !== page.sourceProductHandle?.value) throw new Error("Page update could not be verified. Review this page before retrying.");
+  return after;
 }
 
 /* =========================================================

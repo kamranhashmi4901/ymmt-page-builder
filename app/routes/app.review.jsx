@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import {
   Form,
@@ -6,6 +6,8 @@ import {
   redirect,
   useLoaderData,
   useNavigation,
+  useFetcher,
+  useRevalidator,
 } from "react-router";
 
 import db from "../db.server";
@@ -20,6 +22,23 @@ import {
 import { getExistingPageHandles } from "../lib/shopify-pages.server";
 
 import { buildYMMTPageHandle, buildYMMTPageTitle } from "../lib/ymmt-pages";
+
+// Reuse duplicate counts checked during selection instead of looking up all
+// selected handles again on the final loader refresh. Fall back after restarts.
+const selectionPageCounts = new Map();
+const countCacheKey = (uploadId, upload) =>
+  JSON.stringify([
+    uploadId,
+    (upload.sourceProducts || []).map((product) => product.handle),
+  ]);
+function rememberPageCounts(uploadId, upload, counts, reset = false) {
+  const key = countCacheKey(uploadId, upload);
+  const saved = reset ? new Map() : selectionPageCounts.get(key) || new Map();
+  for (const [id, count] of counts) saved.set(id, count);
+  selectionPageCounts.set(key, saved);
+  if (selectionPageCounts.size > 8)
+    selectionPageCounts.delete(selectionPageCounts.keys().next().value);
+}
 
 function getFiltersFromURL(url) {
   return {
@@ -241,117 +260,108 @@ async function saveCurrentPageSelection({
   }
 
   await db.$transaction(operations);
+  rememberPageCounts(
+    uploadId,
+    upload,
+    records.map((record) => [
+      record.id,
+      buildRecordProposals(record, upload, existingHandles).filter(
+        (proposal) => !proposal.duplicate,
+      ).length,
+    ]),
+  );
 }
 
-async function selectAllMatchingRecords({ uploadId, upload, filters, admin }) {
-  /*
-   * Clear old selection first.
-   */
-  await db.ymmtRecord.updateMany({
-    where: {
-      uploadId,
-    },
-
-    data: {
-      selected: false,
-    },
+async function selectAllMatchingRecords({
+  uploadId,
+  upload,
+  filters,
+  admin,
+  selectionPage = 1,
+}) {
+  const pageSize = 50;
+  const result = await getFilteredYMMTRecords({
+    uploadId,
+    ...filters,
+    page: selectionPage,
+    pageSize,
   });
+  const candidates = [
+    ...new Set(buildCandidateHandles(result.records, upload)),
+  ];
+  const existingHandles = await getExistingPageHandles(admin, candidates);
+  const duplicateIds = [];
+  const selectableIds = [];
+  let newPages = 0;
 
-  /*
-   * Process matching records in chunks.
-   *
-   * Each batch checks only its own proposed
-   * Shopify handles.
-   */
-  const batchSize = 1000;
+  for (const record of result.records) {
+    const proposals = buildRecordProposals(record, upload, existingHandles);
+    const missing = proposals.filter((proposal) => !proposal.duplicate).length;
+    if (missing === 0) duplicateIds.push(record.id);
+    else {
+      selectableIds.push(record.id);
+      newPages += missing;
+    }
+  }
 
-  let currentPage = 1;
-
-  let totalPages = 1;
-
-  do {
-    const result = await getFilteredYMMTRecords({
-      uploadId,
-      ...filters,
-
-      page: currentPage,
-
-      pageSize: batchSize,
-    });
-
-    totalPages = result.totalPages;
-
-    const candidateHandles = buildCandidateHandles(result.records, upload);
-
-    const existingHandles = await getExistingPageHandles(
-      admin,
-      candidateHandles,
+  // Check the first batch successfully before replacing the previous selection.
+  const operations = [];
+  if (selectionPage === 1) {
+    operations.push(
+      db.ymmtRecord.updateMany({
+        where: { uploadId },
+        data: { selected: false },
+      }),
     );
+  }
+  if (duplicateIds.length) {
+    operations.push(
+      db.ymmtRecord.updateMany({
+        where: { uploadId, id: { in: duplicateIds } },
+        data: { duplicate: true, selected: false },
+      }),
+    );
+  }
+  if (selectableIds.length) {
+    operations.push(
+      db.ymmtRecord.updateMany({
+        where: { uploadId, id: { in: selectableIds } },
+        data: { duplicate: false, selected: true },
+      }),
+    );
+  }
+  if (operations.length) await db.$transaction(operations);
+  rememberPageCounts(
+    uploadId,
+    upload,
+    result.records.map((record) => [
+      record.id,
+      buildRecordProposals(record, upload, existingHandles).filter(
+        (proposal) => !proposal.duplicate,
+      ).length,
+    ]),
+    selectionPage === 1,
+  );
 
-    const duplicateIds = [];
+  return {
+    uploadId,
+    filters,
+    page: selectionPage,
+    total: result.total,
+    processed: Math.min(selectionPage * pageSize, result.total),
+    selectedInBatch: selectableIds.length,
+    newPagesInBatch: newPages,
+    duplicatesInBatch: duplicateIds.length,
+    hasNext: selectionPage < result.totalPages,
+    nextPage: selectionPage + 1,
+  };
+}
 
-    const selectableIds = [];
-
-    for (const record of result.records) {
-      const proposals = buildRecordProposals(record, upload, existingHandles);
-
-      const allDuplicate =
-        proposals.length > 0 &&
-        proposals.every((proposal) => proposal.duplicate);
-
-      if (allDuplicate) {
-        duplicateIds.push(record.id);
-      } else {
-        selectableIds.push(record.id);
-      }
-    }
-
-    const operations = [];
-
-    if (duplicateIds.length > 0) {
-      operations.push(
-        db.ymmtRecord.updateMany({
-          where: {
-            uploadId,
-
-            id: {
-              in: duplicateIds,
-            },
-          },
-
-          data: {
-            duplicate: true,
-            selected: false,
-          },
-        }),
-      );
-    }
-
-    if (selectableIds.length > 0) {
-      operations.push(
-        db.ymmtRecord.updateMany({
-          where: {
-            uploadId,
-
-            id: {
-              in: selectableIds,
-            },
-          },
-
-          data: {
-            duplicate: false,
-            selected: true,
-          },
-        }),
-      );
-    }
-
-    if (operations.length > 0) {
-      await db.$transaction(operations);
-    }
-
-    currentPage += 1;
-  } while (currentPage <= totalPages);
+// Selection fetcher requests already return progress. Avoid rechecking every
+// selected Shopify handle after each 50-record batch. Revalidate once at the end.
+export function shouldRevalidate({ actionResult, defaultShouldRevalidate }) {
+  if (actionResult?.selection || actionResult?.selectionError) return false;
+  return defaultShouldRevalidate;
 }
 
 /* =========================================================
@@ -420,10 +430,18 @@ export const loader = async ({ request }) => {
    * - current visible review page
    * - currently selected records
    */
-  const candidateHandles = buildCandidateHandles(
-    [...result.records, ...selectedRecords],
-    upload,
-  );
+  const savedCounts = selectionPageCounts.get(countCacheKey(uploadId, upload));
+  const countsKnown =
+    savedCounts &&
+    selectedRecords.every((record) => savedCounts.has(record.id));
+  const candidateHandles = [
+    ...new Set(
+      buildCandidateHandles(
+        countsKnown ? result.records : [...result.records, ...selectedRecords],
+        upload,
+      ),
+    ),
+  ];
 
   const existingHandles = await getExistingPageHandles(admin, candidateHandles);
 
@@ -448,11 +466,13 @@ export const loader = async ({ request }) => {
   let selectedPageCount = 0;
 
   for (const record of selectedRecords) {
-    selectedPageCount += buildRecordProposals(
-      record,
-      upload,
-      existingHandles,
-    ).filter((proposal) => !proposal.duplicate).length;
+    const visible = result.records.some((item) => item.id === record.id);
+    selectedPageCount +=
+      countsKnown && !visible
+        ? savedCounts.get(record.id)
+        : buildRecordProposals(record, upload, existingHandles).filter(
+            (proposal) => !proposal.duplicate,
+          ).length;
   }
 
   return {
@@ -511,21 +531,28 @@ export const action = async ({ request }) => {
   );
 
   if (intent === "select-all-matching") {
-    await selectAllMatchingRecords({
-      uploadId,
-      upload,
-      filters,
-      admin,
-    });
-
-    return redirect(
-      buildReviewURL({
-        uploadId,
-        filters,
-
-        page: currentPage,
-      }),
-    );
+    const selectionPage = Number(formData.get("selectionPage") || "1");
+    if (!Number.isSafeInteger(selectionPage) || selectionPage < 1) {
+      return { selectionError: "Invalid selection batch." };
+    }
+    try {
+      return {
+        selection: await selectAllMatchingRecords({
+          uploadId,
+          upload,
+          filters,
+          admin,
+          selectionPage,
+        }),
+      };
+    } catch (error) {
+      return {
+        selectionError: String(
+          error?.message || "Unable to select matching vehicles.",
+        ),
+        selectionPage,
+      };
+    }
   }
 
   if (intent === "clear-selection") {
@@ -664,7 +691,101 @@ export default function Review() {
 
   const navigation = useNavigation();
 
-  const busy = navigation.state === "submitting";
+  const selectionFetcher = useFetcher();
+  const revalidator = useRevalidator();
+  const [selectAllRunning, setSelectAllRunning] = useState(false);
+  const [selectionProgress, setSelectionProgress] = useState(null);
+  const selectionContext = useRef(null);
+  const expectedSelectionPage = useRef(1);
+  const handledSelectionPage = useRef(0);
+  const [selectionError, setSelectionError] = useState("");
+  const [retrySelectionPage, setRetrySelectionPage] = useState(null);
+  const scope = JSON.stringify([upload.id, filters]);
+  const busy =
+    navigation.state !== "idle" ||
+    selectAllRunning ||
+    selectionFetcher.state !== "idle" ||
+    revalidator.state !== "idle";
+
+  const submitSelectionPage = (selectionPage) => {
+    expectedSelectionPage.current = selectionPage;
+    selectionFetcher.submit(
+      {
+        intent: "select-all-matching",
+        selectionPage: String(selectionPage),
+        uploadId: upload.id,
+        currentPage: String(page),
+        ...filters,
+      },
+      { method: "post", action: "/app/review" },
+    );
+  };
+
+  const startSelectAll = (event) => {
+    event.preventDefault();
+    selectionContext.current = scope;
+    handledSelectionPage.current = 0;
+    setSelectionProgress(null);
+    setSelectionError("");
+    setRetrySelectionPage(null);
+    setSelectAllRunning(true);
+    submitSelectionPage(1);
+  };
+
+  useEffect(() => {
+    if (selectionContext.current && selectionContext.current !== scope) {
+      setSelectAllRunning(false);
+      setSelectionProgress(null);
+      setSelectionError("");
+      setRetrySelectionPage(null);
+      selectionContext.current = null;
+      return;
+    }
+    if (!selectAllRunning || selectionFetcher.state !== "idle") return;
+    const data = selectionFetcher.data;
+    if (data?.selectionError) {
+      setSelectionError(data.selectionError);
+      setRetrySelectionPage(
+        data.selectionPage || expectedSelectionPage.current,
+      );
+      setSelectAllRunning(false);
+      return;
+    }
+    const progress = data?.selection;
+    if (
+      !progress ||
+      progress.uploadId !== upload.id ||
+      progress.page !== expectedSelectionPage.current
+    )
+      return;
+    if (
+      JSON.stringify([progress.uploadId, progress.filters]) !==
+      selectionContext.current
+    )
+      return;
+    if (handledSelectionPage.current === progress.page) return;
+    handledSelectionPage.current = progress.page;
+    setSelectionProgress((previous) => ({
+      ...progress,
+      selected: (previous?.selected || 0) + progress.selectedInBatch,
+      newPages: (previous?.newPages || 0) + progress.newPagesInBatch,
+      duplicates: (previous?.duplicates || 0) + progress.duplicatesInBatch,
+    }));
+    if (progress.hasNext) {
+      // Stay with the frozen filter context until the selection finishes.
+      submitSelectionPage(progress.nextPage);
+    } else {
+      setSelectAllRunning(false);
+      setRetrySelectionPage(null);
+      revalidator.revalidate();
+    }
+  }, [
+    selectionFetcher.data,
+    selectionFetcher.state,
+    selectAllRunning,
+    scope,
+    upload.id,
+  ]);
 
   const [selectedIds, setSelectedIds] = useState(
     () =>
@@ -1022,6 +1143,48 @@ export default function Review() {
 
         <s-section>
           <strong>Selection</strong>
+          {selectionProgress && (
+            <p role="status" aria-live="polite">
+              {selectAllRunning
+                ? "Selecting matching vehicles"
+                : selectionProgress.hasNext
+                  ? "Selection paused"
+                  : "Selection complete"}
+              : {selectionProgress.processed.toLocaleString()} /{" "}
+              {selectionProgress.total.toLocaleString()} checked ·{" "}
+              {selectionProgress.selected.toLocaleString()} selected vehicles ·{" "}
+              {selectionProgress.newPages.toLocaleString()} new pages ·{" "}
+              {selectionProgress.duplicates.toLocaleString()} fully duplicate
+              vehicles skipped.
+            </p>
+          )}
+          {selectionError && (
+            <div
+              role="alert"
+              style={{
+                marginTop: "12px",
+                padding: "12px",
+                background: "#fff4f4",
+                color: "#8a2e1b",
+                borderRadius: "8px",
+              }}
+            >
+              {selectionError} Earlier completed batches remain selected.{" "}
+              {retrySelectionPage && (
+                <button
+                  type="button"
+                  disabled={busy}
+                  onClick={() => {
+                    setSelectionError("");
+                    setSelectAllRunning(true);
+                    submitSelectionPage(retrySelectionPage);
+                  }}
+                >
+                  Retry selection batch
+                </button>
+              )}
+            </div>
+          )}
 
           <div
             style={{
@@ -1038,6 +1201,7 @@ export default function Review() {
               type="button"
 
               onClick={toggleCurrentPage}
+              disabled={busy}
 
               style={{
                 display: "inline-block",
@@ -1060,15 +1224,17 @@ export default function Review() {
                 : "Select Current Page"}
             </button>
 
-            <Form method="post">
+            <selectionFetcher.Form
+              method="post"
+              action="/app/review"
+              onSubmit={startSelectAll}
+            >
               {hiddenContext}
+              <input type="hidden" name="intent" value="select-all-matching" />
+              <input type="hidden" name="selectionPage" value="1" />
 
               <button
                 type="submit"
-
-                name="intent"
-
-                value="select-all-matching"
 
                 disabled={busy || total === 0}
 
@@ -1088,9 +1254,11 @@ export default function Review() {
                   fontWeight: "650",
                 }}
               >
-                Select All Matching Vehicles ({total})
+                {selectAllRunning
+                  ? `Selecting… ${selectionProgress?.processed || 0}/${total}`
+                  : `Select All Matching Vehicles (${total})`}
               </button>
-            </Form>
+            </selectionFetcher.Form>
 
             <Form method="post">
               {hiddenContext}
@@ -1210,7 +1378,7 @@ export default function Review() {
 
                             checked={selectedIds.has(record.id)}
 
-                            disabled={record.duplicate}
+                            disabled={busy || record.duplicate}
 
                             onChange={() => toggleRecord(record.id)}
                           />
@@ -1316,6 +1484,7 @@ export default function Review() {
                       name="intent"
 
                       value="go-page"
+                      disabled={busy}
 
                       onClick={(event) => {
                         const form = event.currentTarget.form;
@@ -1348,6 +1517,7 @@ export default function Review() {
                       name="intent"
 
                       value="go-page"
+                      disabled={busy}
 
                       style={{
                         padding: "9px 14px",

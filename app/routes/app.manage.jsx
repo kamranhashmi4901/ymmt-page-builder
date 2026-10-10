@@ -22,6 +22,7 @@ import {
 } from "../lib/shopify-manage-pages.server";
 
 import { parseYMMT } from "../lib/ymmt-parser.server";
+import { saveManageJsonSource, loadManageJsonSource } from "../lib/ymmt-manage-json-source.server";
 
 import {
   createActionSession,
@@ -334,6 +335,8 @@ export const action = async ({ request }) => {
         };
       }
 
+      const jsonSourceId = await saveManageJsonSource(shop, parsed.entries, file.name);
+
       /*
        * Create persistent search job.
        * Action returns immediately.
@@ -367,6 +370,7 @@ export const action = async ({ request }) => {
         fileName: file.name,
 
         totalRecords: parsed.entries.length,
+        jsonSourceId,
       };
     } catch (error) {
       return {
@@ -524,6 +528,12 @@ export const action = async ({ request }) => {
   ------------------------------------------------------- */
 
   if (intent === "update-content") {
+    let jsonSource;
+    try {
+      jsonSource = await loadManageJsonSource(shop, String(formData.get("jsonSourceId") || ""));
+    } catch (error) {
+      return { success: false, intent, error: error.message };
+    }
     const actionSession = await createActionSession({
       shop,
 
@@ -550,7 +560,7 @@ export const action = async ({ request }) => {
           beforeData: beforeSnapshot,
         });
 
-        await updateYMMTPageContent(admin, pageId);
+        await updateYMMTPageContent(admin, pageId, { jsonSource });
 
         const afterSnapshot = await getShopifyPageSnapshot(admin, pageId);
 
@@ -810,6 +820,7 @@ export default function ManagePages() {
   ------------------------------------------------------- */
 
   const [searchJobId, setSearchJobId] = useState(null);
+  const [jsonSourceId, setJsonSourceId] = useState("");
   const [searchLogs, setSearchLogs] = useState([]);
 
   const searchJob = searchFetcher.data;
@@ -822,6 +833,7 @@ export default function ManagePages() {
     }
 
     setSearchMode("manual");
+    setJsonSourceId("");
 
     setSearchJobId(data.jobId);
 
@@ -841,6 +853,7 @@ export default function ManagePages() {
     }
 
     setSearchMode("json");
+    setJsonSourceId(data.jsonSourceId || "");
 
     setSearchJobId(data.jobId);
 
@@ -2013,7 +2026,7 @@ export default function ManagePages() {
 
                 title="Update Page Content"
 
-                description="Rebuild the page body using its YMMT vehicle data."
+                description="Correct the vehicle metafield and script using your uploaded JSON."
 
                 onClick={() => setSelectedAction("update-content")}
               />
@@ -2140,8 +2153,7 @@ export default function ManagePages() {
                   borderRadius: "10px",
                 }}
               >
-                Page content will be rebuilt using each page&apos;s{" "}
-                <code>ymmt.vehicle</code> metafield.
+                {jsonSourceId ? "The vehicle metafield and page script will use the corrected values from your uploaded JSON. Other page HTML and product links will be preserved." : "Search using your corrected JSON before updating content. The existing page values will not be used as the correction source."}
               </div>
             )}
 
@@ -2188,6 +2200,7 @@ export default function ManagePages() {
             />
 
             <Form method="post">
+              <input type="hidden" name="jsonSourceId" value={jsonSourceId} />
               {[...selectedIds].map((pageId) => (
                 <input
                   key={pageId}
@@ -2246,6 +2259,7 @@ export default function ManagePages() {
 
                   disabled={
                     isSubmitting ||
+                    (selectedAction === "update-content" && !jsonSourceId) ||
                     (selectedAction === "update-product" &&
                       !productHandle.trim()) ||
                     (selectedAction === "delete" &&

@@ -560,7 +560,7 @@ export const action = async ({ request }) => {
           beforeData: beforeSnapshot,
         });
 
-        await updateYMMTPageContent(admin, pageId, { jsonSource });
+        const updatedPage = await updateYMMTPageContent(admin, pageId, { jsonSource });
 
         const afterSnapshot = await getShopifyPageSnapshot(admin, pageId);
 
@@ -578,6 +578,7 @@ export const action = async ({ request }) => {
           handle: afterSnapshot.handle,
 
           status: "updated",
+          vehicle: JSON.parse(updatedPage.vehicle.value),
         });
       } catch (error) {
         if (changeLog) {
@@ -703,6 +704,33 @@ export const action = async ({ request }) => {
     };
   }
 };
+
+function updatedPagesCsv(results = []) {
+  const cell = (value) => {
+    let text = String(value ?? "");
+    // Keep spreadsheet software from interpreting page text as a formula.
+    if (/^[\s]*[=+\-@]|^[\t\r\n]/.test(text)) text = "'" + text;
+    return '"' + text.replace(/"/g, '""') + '"';
+  };
+  const rows = [["Page ID", "Page Handle", "Vehicle", "Compatibility", "Warning"]];
+  for (const result of results) {
+    if (result.status !== "updated" || !result.vehicle) continue;
+    const v = result.vehicle;
+    rows.push([result.pageId.split("/").pop(), result.handle, [v.year, v.make, v.model, v.trim].filter(Boolean).join(" "), v.compatible || v.compat || "", v.warning || ""]);
+  }
+  return "\uFEFF" + rows.map((row) => row.map(cell).join(",")).join("\r\n") + "\r\n";
+}
+
+function downloadUpdatedPagesCsv(results, sessionId) {
+  const url = URL.createObjectURL(new Blob([updatedPagesCsv(results)], { type: "text/csv;charset=utf-8" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `ymmt-updated-pages-${sessionId || Date.now()}.csv`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 /* =========================================================
    STYLES
@@ -2419,6 +2447,10 @@ export default function ManagePages() {
                   Page content updated: <strong>{actionData.updated}</strong>
                   {" · "}
                   Failed: <strong>{actionData.failed}</strong>
+                  {actionData.updated > 0 && <div style={{ marginTop: "12px" }}>
+                    <button type="button" style={primaryButton} onClick={() => downloadUpdatedPagesCsv(actionData.results, actionData.sessionId)}>Download Updated Pages CSV</button>
+                    <p style={{ marginBottom: 0, fontSize: "12px" }}>Successfully updated pages from this operation only. Download before refreshing or starting another update.</p>
+                  </div>}
                 </>
               )}
 

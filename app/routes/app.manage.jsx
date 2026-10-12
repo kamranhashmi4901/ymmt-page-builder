@@ -41,6 +41,47 @@ import {
   startYMMTPageSearchJob,
 } from "../lib/ymmt-page-search-jobs.server";
 
+function sessionChanges(session) {
+  return Array.isArray(session?.changes) ? session.changes : [];
+}
+
+function savedSessionView(session, offset = 0) {
+  if (!session) return null;
+  const changes = sessionChanges(session);
+  const success = changes.filter((c) => c.status === "success").length;
+  const failed = changes.filter((c) => c.status === "failed").length;
+  const total = Number(session.totalPages) || changes.length;
+  const processed = success + failed;
+  const lastActivity = changes.reduce((latest, c) => {
+    const time = c.updatedAt || c.createdAt;
+    return time && Date.parse(time) > Date.parse(latest) ? time : latest;
+  }, session.updatedAt || session.createdAt);
+  const summary = (c) => ({ id: c.id, handle: c.handle, action: c.action, status: c.status, rolledBackAt: c.rolledBackAt, time: c.updatedAt || c.createdAt || null, message: String(c.errorMessage || c.error || c.message || "").slice(0, 1000) });
+  offset = Math.max(0, Math.floor(Number(offset) || 0));
+  return {
+    id: session.id, actionType: session.actionType, createdAt: session.createdAt,
+    status: session.status, rolledBackAt: session.rolledBackAt, totalPages: total,
+    successCount: success, failedCount: failed, processed,
+    remaining: Math.max(0, total - processed), lastActivity,
+    progress: total ? Math.min(100, Math.floor(processed / total * 100)) : 0,
+    changes: changes.slice(offset, offset + 50).map(summary),
+    changeCount: changes.length, offset,
+    logs: changes.slice(-100).map(summary).reverse(), fetchedAt: Date.now(),
+  };
+}
+
+function savedSessionCsvRows(session) {
+  return sessionChanges(session).filter((c) => c.status === "success" && !c.rolledBackAt).map((change) => {
+    let snapshot = {};
+    try { snapshot = typeof change.afterData === "string" ? JSON.parse(change.afterData) : change.afterData || {}; } catch { /* Leave unavailable recorded values blank. */ }
+    let vehicle = {};
+    const field = snapshot.metafields?.nodes?.find((m) => m.namespace === "ymmt" && m.key === "vehicle");
+    try { vehicle = JSON.parse(field?.value || snapshot.vehicle?.value || "{}"); } catch { /* Missing/invalid snapshots cannot supply vehicle values. */ }
+    if (!vehicle || typeof vehicle !== "object" || Array.isArray(vehicle)) vehicle = {};
+    return { pageId: String(change.shopifyPageId || snapshot.id || ""), handle: change.handle || snapshot.handle || "", status: "updated", vehicle };
+  });
+}
+
 /* =========================================================
    LOADER
 ========================================================= */
@@ -49,6 +90,16 @@ export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
 
   const url = new URL(request.url);
+  if (url.searchParams.has("_sessionLogs") || url.searchParams.has("_sessionCsv")) {
+    const id = url.searchParams.get("sessionId") || "";
+    try {
+      const sessionLog = id ? await getActionSession(session.shop, id) : null;
+      if (!sessionLog) return { session: null, error: "Saved session not found for this store." };
+      if (url.searchParams.has("_sessionCsv")) return { csv: updatedPagesCsv(savedSessionCsvRows(sessionLog)), fileName: `ymmt-updated-pages-${sessionLog.id}.csv`, requestKey: `${sessionLog.id}-${Date.now()}` };
+      return { session: savedSessionView(sessionLog, url.searchParams.get("logOffset")), error: "" };
+    } catch { return { session: null, error: "Unable to refresh saved session logs. Try Refresh Logs again." }; }
+  }
+
 
   const filters = {
     search: url.searchParams.get("search") || "",
@@ -87,7 +138,7 @@ export const loader = async ({ request }) => {
   let selectedSession = null;
 
   if (sessionId) {
-    selectedSession = await getActionSession(session.shop, sessionId);
+    selectedSession = savedSessionView(await getActionSession(session.shop, sessionId), url.searchParams.get("logOffset"));
   }
 
   return {
@@ -135,6 +186,8 @@ export const action = async ({ request }) => {
         error: "Session not found.",
       };
     }
+
+    if (actionSession.status === "running") return { success: false, error: "Wait for the running session to finish before rolling back." };
 
     if (actionSession.rolledBackAt) {
       return {
@@ -721,15 +774,19 @@ function updatedPagesCsv(results = []) {
   return "\uFEFF" + rows.map((row) => row.map(cell).join(",")).join("\r\n") + "\r\n";
 }
 
-function downloadUpdatedPagesCsv(results, sessionId) {
-  const url = URL.createObjectURL(new Blob([updatedPagesCsv(results)], { type: "text/csv;charset=utf-8" }));
+function downloadCsvText(csv, fileName) {
+  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
   const link = document.createElement("a");
   link.href = url;
-  link.download = `ymmt-updated-pages-${sessionId || Date.now()}.csv`;
+  link.download = fileName;
   document.body.appendChild(link);
   link.click();
   link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function downloadUpdatedPagesCsv(results, sessionId) {
+  downloadCsvText(updatedPagesCsv(results), `ymmt-updated-pages-${sessionId || Date.now()}.csv`);
 }
 
 /* =========================================================
@@ -816,8 +873,27 @@ export default function ManagePages() {
     filters,
     recentSessions,
     hasFilters,
-    selectedSession,
+    selectedSession: initialSelectedSession,
   } = useLoaderData();
+  const sessionLogFetcher = useFetcher();
+  const sessionCsvFetcher = useFetcher();
+  const downloadedSessionCsv = useRef("");
+  const selectedSession = sessionLogFetcher.data?.session?.id === initialSelectedSession?.id && sessionLogFetcher.data.session.offset === initialSelectedSession.offset && sessionLogFetcher.data.session.fetchedAt >= initialSelectedSession.fetchedAt ? sessionLogFetcher.data.session : initialSelectedSession;
+  const [logClock, setLogClock] = useState(Date.now());
+  const refreshSessionLogs = () => {
+    if (selectedSession && sessionLogFetcher.state === "idle") sessionLogFetcher.load(`/app/manage?_sessionLogs=1&sessionId=${encodeURIComponent(selectedSession.id)}&logOffset=${selectedSession.offset}`);
+  };
+  useEffect(() => {
+    if (!selectedSession || selectedSession.status !== "running") return;
+    const timer = setTimeout(() => { setLogClock(Date.now()); refreshSessionLogs(); }, 10000);
+    return () => clearTimeout(timer);
+  }, [selectedSession?.id, selectedSession?.status, selectedSession?.offset, selectedSession?.fetchedAt, sessionLogFetcher.state, sessionLogFetcher.data]);
+  useEffect(() => {
+    const data = sessionCsvFetcher.data;
+    if (!data?.csv || downloadedSessionCsv.current === data.requestKey) return;
+    downloadedSessionCsv.current = data.requestKey;
+    downloadCsvText(data.csv, data.fileName);
+  }, [sessionCsvFetcher.data]);
 
   const actionData = useActionData();
 
@@ -2532,9 +2608,9 @@ export default function ManagePages() {
 
                       <td style={cellStyle}>{session.totalPages}</td>
 
-                      <td style={cellStyle}>{session.successCount}</td>
+                      <td style={cellStyle}>{selectedSession?.id === session.id ? selectedSession.successCount : session.successCount}</td>
 
-                      <td style={cellStyle}>{session.failedCount}</td>
+                      <td style={cellStyle}>{selectedSession?.id === session.id ? selectedSession.failedCount : session.failedCount}</td>
 
                       <td style={cellStyle}>{session.status}</td>
 
@@ -2588,7 +2664,7 @@ export default function ManagePages() {
                   gap: "10px",
                 }}
               >
-                {!selectedSession.rolledBackAt && (
+                {!selectedSession.rolledBackAt && selectedSession.status !== "running" && (
                   <Form method="post">
                     <input
                       type="hidden"
@@ -2624,6 +2700,25 @@ export default function ManagePages() {
 
                 <Link to="/app/manage">Close</Link>
               </div>
+            </div>
+
+            <div style={{ marginBottom: "16px" }}>
+              <strong>{selectedSession.processed.toLocaleString()} / {selectedSession.totalPages.toLocaleString()} processed ({selectedSession.progress}%)</strong>
+              <p>Successful: {selectedSession.successCount.toLocaleString()} · Failed: {selectedSession.failedCount.toLocaleString()} · Remaining: {selectedSession.remaining.toLocaleString()} · Saved status: {selectedSession.status}</p>
+              <p>Last saved activity: {selectedSession.lastActivity ? new Date(selectedSession.lastActivity).toLocaleString() : "Unavailable"}. {selectedSession.status === "running" ? "Logs refresh every 10 seconds." : "Saved logs remain available after reload."}</p>
+              {selectedSession.status === "running" && selectedSession.lastActivity && logClock - Date.parse(selectedSession.lastActivity) > 120000 && <p role="status">No new saved activity for over two minutes. The saved “running” status does not confirm that the worker is still active. Check server logs before starting another update.</p>}
+              {sessionLogFetcher.data?.error && <p role="alert">{sessionLogFetcher.data.error}</p>}
+              {sessionCsvFetcher.data?.error && <p role="alert">{sessionCsvFetcher.data.error}</p>}
+              <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+                <button type="button" style={secondaryButton} disabled={sessionLogFetcher.state !== "idle"} onClick={refreshSessionLogs}>{sessionLogFetcher.state !== "idle" ? "Refreshing…" : "Refresh Logs"}</button>
+                {selectedSession.actionType === "update-content" && selectedSession.successCount > 0 && <button type="button" style={primaryButton} disabled={sessionCsvFetcher.state !== "idle"} onClick={() => sessionCsvFetcher.load(`/app/manage?_sessionCsv=1&sessionId=${encodeURIComponent(selectedSession.id)}`)}>{sessionCsvFetcher.state !== "idle" ? "Preparing CSV…" : "Download Updated Pages CSV"}</button>}
+              </div>
+              <div role="log" aria-live="polite" aria-label="Saved page update logs" style={{ background: "#080808", color: "#eee", borderRadius: "10px", padding: "16px", marginTop: "14px", maxHeight: "400px", overflow: "auto", fontFamily: "monospace", fontSize: "12px", lineHeight: 1.8 }}>
+                <div>[SESSION] {selectedSession.actionType} · {selectedSession.status}</div>
+                {selectedSession.logs.length === 0 && <div>[WAITING] No per-page results have been saved yet.</div>}
+                {selectedSession.logs.map((entry) => <div key={entry.id} style={{ color: entry.status === "failed" ? "#ff9b9b" : entry.status === "success" ? "#9ee6b1" : "#eee" }}>[{entry.time ? new Date(entry.time).toLocaleTimeString() : "SAVED"}] [{String(entry.status || "pending").toUpperCase()}] {entry.handle || entry.id}{entry.message ? ` — ${entry.message}` : ""}{entry.rolledBackAt ? " — rolled back" : ""}</div>)}
+              </div>
+              <p style={{ fontSize: "12px" }}>Latest 100 saved entries shown above. CSV uses recorded post-update values; unavailable values are left blank.</p>
             </div>
 
             <div
@@ -2682,6 +2777,11 @@ export default function ManagePages() {
                   ))}
                 </tbody>
               </table>
+            </div>
+            <div style={{ display: "flex", gap: "12px", marginTop: "12px" }}>
+              {selectedSession.offset > 0 && <Link to={`/app/manage?sessionId=${selectedSession.id}&logOffset=${Math.max(0, selectedSession.offset - 50)}`}>Previous 50</Link>}
+              {selectedSession.offset + selectedSession.changes.length < selectedSession.changeCount && <Link to={`/app/manage?sessionId=${selectedSession.id}&logOffset=${selectedSession.offset + 50}`}>Next 50</Link>}
+              <span>{selectedSession.changeCount ? `${selectedSession.offset + 1}–${selectedSession.offset + selectedSession.changes.length} of ${selectedSession.changeCount} saved results` : "No saved results yet"}</span>
             </div>
           </s-section>
         )}

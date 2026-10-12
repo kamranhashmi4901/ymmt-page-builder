@@ -22,7 +22,10 @@ import {
 } from "../lib/shopify-manage-pages.server";
 
 import { parseYMMT } from "../lib/ymmt-parser.server";
-import { saveManageJsonSource, loadManageJsonSource } from "../lib/ymmt-manage-json-source.server";
+import {
+  saveManageJsonSource,
+  loadManageJsonSource,
+} from "../lib/ymmt-manage-json-source.server";
 
 import {
   createActionSession,
@@ -56,30 +59,71 @@ function savedSessionView(session, offset = 0) {
     const time = c.updatedAt || c.createdAt;
     return time && Date.parse(time) > Date.parse(latest) ? time : latest;
   }, session.updatedAt || session.createdAt);
-  const summary = (c) => ({ id: c.id, handle: c.handle, action: c.action, status: c.status, rolledBackAt: c.rolledBackAt, time: c.updatedAt || c.createdAt || null, message: String(c.errorMessage || c.error || c.message || "").slice(0, 1000) });
+  const summary = (c) => ({
+    id: c.id,
+    handle: c.handle,
+    action: c.action,
+    status: c.status,
+    rolledBackAt: c.rolledBackAt,
+    time: c.updatedAt || c.createdAt || null,
+    message: String(c.errorMessage || c.error || c.message || "").slice(
+      0,
+      1000,
+    ),
+  });
   offset = Math.max(0, Math.floor(Number(offset) || 0));
   return {
-    id: session.id, actionType: session.actionType, createdAt: session.createdAt,
-    status: session.status, rolledBackAt: session.rolledBackAt, totalPages: total,
-    successCount: success, failedCount: failed, processed,
-    remaining: Math.max(0, total - processed), lastActivity,
-    progress: total ? Math.min(100, Math.floor(processed / total * 100)) : 0,
+    id: session.id,
+    actionType: session.actionType,
+    createdAt: session.createdAt,
+    status: session.status,
+    rolledBackAt: session.rolledBackAt,
+    totalPages: total,
+    successCount: success,
+    failedCount: failed,
+    processed,
+    remaining: Math.max(0, total - processed),
+    lastActivity,
+    progress: total ? Math.min(100, Math.floor((processed / total) * 100)) : 0,
     changes: changes.slice(offset, offset + 50).map(summary),
-    changeCount: changes.length, offset,
-    logs: changes.slice(-100).map(summary).reverse(), fetchedAt: Date.now(),
+    changeCount: changes.length,
+    offset,
+    logs: changes.slice(-100).map(summary).reverse(),
+    fetchedAt: Date.now(),
   };
 }
 
 function savedSessionCsvRows(session) {
-  return sessionChanges(session).filter((c) => c.status === "success" && !c.rolledBackAt).map((change) => {
-    let snapshot = {};
-    try { snapshot = typeof change.afterData === "string" ? JSON.parse(change.afterData) : change.afterData || {}; } catch { /* Leave unavailable recorded values blank. */ }
-    let vehicle = {};
-    const field = snapshot.metafields?.nodes?.find((m) => m.namespace === "ymmt" && m.key === "vehicle");
-    try { vehicle = JSON.parse(field?.value || snapshot.vehicle?.value || "{}"); } catch { /* Missing/invalid snapshots cannot supply vehicle values. */ }
-    if (!vehicle || typeof vehicle !== "object" || Array.isArray(vehicle)) vehicle = {};
-    return { pageId: String(change.shopifyPageId || snapshot.id || ""), handle: change.handle || snapshot.handle || "", status: "updated", vehicle };
-  });
+  return sessionChanges(session)
+    .filter((c) => c.status === "success" && !c.rolledBackAt)
+    .map((change) => {
+      let snapshot = {};
+      try {
+        snapshot =
+          typeof change.afterData === "string"
+            ? JSON.parse(change.afterData)
+            : change.afterData || {};
+      } catch {
+        /* Leave unavailable recorded values blank. */
+      }
+      let vehicle = {};
+      const field = snapshot.metafields?.nodes?.find(
+        (m) => m.namespace === "ymmt" && m.key === "vehicle",
+      );
+      try {
+        vehicle = JSON.parse(field?.value || snapshot.vehicle?.value || "{}");
+      } catch {
+        /* Missing/invalid snapshots cannot supply vehicle values. */
+      }
+      if (!vehicle || typeof vehicle !== "object" || Array.isArray(vehicle))
+        vehicle = {};
+      return {
+        pageId: String(change.shopifyPageId || snapshot.id || ""),
+        handle: change.handle || snapshot.handle || "",
+        status: "updated",
+        vehicle,
+      };
+    });
 }
 
 /* =========================================================
@@ -90,16 +134,38 @@ export const loader = async ({ request }) => {
   const { admin, session } = await authenticate.admin(request);
 
   const url = new URL(request.url);
-  if (url.searchParams.has("_sessionLogs") || url.searchParams.has("_sessionCsv")) {
+  if (
+    url.searchParams.has("_sessionLogs") ||
+    url.searchParams.has("_sessionCsv")
+  ) {
     const id = url.searchParams.get("sessionId") || "";
     try {
       const sessionLog = id ? await getActionSession(session.shop, id) : null;
-      if (!sessionLog) return { session: null, error: "Saved session not found for this store." };
-      if (url.searchParams.has("_sessionCsv")) return { csv: updatedPagesCsv(savedSessionCsvRows(sessionLog)), fileName: `ymmt-updated-pages-${sessionLog.id}.csv`, requestKey: `${sessionLog.id}-${Date.now()}` };
-      return { session: savedSessionView(sessionLog, url.searchParams.get("logOffset")), error: "" };
-    } catch { return { session: null, error: "Unable to refresh saved session logs. Try Refresh Logs again." }; }
+      if (!sessionLog)
+        return {
+          session: null,
+          error: "Saved session not found for this store.",
+        };
+      if (url.searchParams.has("_sessionCsv"))
+        return {
+          csv: updatedPagesCsv(savedSessionCsvRows(sessionLog)),
+          fileName: `ymmt-updated-pages-${sessionLog.id}.csv`,
+          requestKey: `${sessionLog.id}-${Date.now()}`,
+        };
+      return {
+        session: savedSessionView(
+          sessionLog,
+          url.searchParams.get("logOffset"),
+        ),
+        error: "",
+      };
+    } catch {
+      return {
+        session: null,
+        error: "Unable to refresh saved session logs. Try Refresh Logs again.",
+      };
+    }
   }
-
 
   const filters = {
     search: url.searchParams.get("search") || "",
@@ -138,7 +204,10 @@ export const loader = async ({ request }) => {
   let selectedSession = null;
 
   if (sessionId) {
-    selectedSession = savedSessionView(await getActionSession(session.shop, sessionId), url.searchParams.get("logOffset"));
+    selectedSession = savedSessionView(
+      await getActionSession(session.shop, sessionId),
+      url.searchParams.get("logOffset"),
+    );
   }
 
   return {
@@ -187,7 +256,11 @@ export const action = async ({ request }) => {
       };
     }
 
-    if (actionSession.status === "running") return { success: false, error: "Wait for the running session to finish before rolling back." };
+    if (actionSession.status === "running")
+      return {
+        success: false,
+        error: "Wait for the running session to finish before rolling back.",
+      };
 
     if (actionSession.rolledBackAt) {
       return {
@@ -388,7 +461,11 @@ export const action = async ({ request }) => {
         };
       }
 
-      const jsonSourceId = await saveManageJsonSource(shop, parsed.entries, file.name);
+      const jsonSourceId = await saveManageJsonSource(
+        shop,
+        parsed.entries,
+        file.name,
+      );
 
       /*
        * Create persistent search job.
@@ -583,7 +660,10 @@ export const action = async ({ request }) => {
   if (intent === "update-content") {
     let jsonSource;
     try {
-      jsonSource = await loadManageJsonSource(shop, String(formData.get("jsonSourceId") || ""));
+      jsonSource = await loadManageJsonSource(
+        shop,
+        String(formData.get("jsonSourceId") || ""),
+      );
     } catch (error) {
       return { success: false, intent, error: error.message };
     }
@@ -613,7 +693,9 @@ export const action = async ({ request }) => {
           beforeData: beforeSnapshot,
         });
 
-        const updatedPage = await updateYMMTPageContent(admin, pageId, { jsonSource });
+        const updatedPage = await updateYMMTPageContent(admin, pageId, {
+          jsonSource,
+        });
 
         const afterSnapshot = await getShopifyPageSnapshot(admin, pageId);
 
@@ -765,17 +847,29 @@ function updatedPagesCsv(results = []) {
     if (/^[\s]*[=+\-@]|^[\t\r\n]/.test(text)) text = "'" + text;
     return '"' + text.replace(/"/g, '""') + '"';
   };
-  const rows = [["Page ID", "Page Handle", "Vehicle", "Compatibility", "Warning"]];
+  const rows = [
+    ["Page ID", "Page Handle", "Vehicle", "Compatibility", "Warning"],
+  ];
   for (const result of results) {
     if (result.status !== "updated" || !result.vehicle) continue;
     const v = result.vehicle;
-    rows.push([result.pageId.split("/").pop(), result.handle, [v.year, v.make, v.model, v.trim].filter(Boolean).join(" "), v.compatible || v.compat || "", v.warning || ""]);
+    rows.push([
+      result.pageId.split("/").pop(),
+      result.handle,
+      [v.year, v.make, v.model, v.trim].filter(Boolean).join(" "),
+      v.compatible || v.compat || "",
+      v.warning || "",
+    ]);
   }
-  return "\uFEFF" + rows.map((row) => row.map(cell).join(",")).join("\r\n") + "\r\n";
+  return (
+    "\uFEFF" + rows.map((row) => row.map(cell).join(",")).join("\r\n") + "\r\n"
+  );
 }
 
 function downloadCsvText(csv, fileName) {
-  const url = URL.createObjectURL(new Blob([csv], { type: "text/csv;charset=utf-8" }));
+  const url = URL.createObjectURL(
+    new Blob([csv], { type: "text/csv;charset=utf-8" }),
+  );
   const link = document.createElement("a");
   link.href = url;
   link.download = fileName;
@@ -786,7 +880,10 @@ function downloadCsvText(csv, fileName) {
 }
 
 function downloadUpdatedPagesCsv(results, sessionId) {
-  downloadCsvText(updatedPagesCsv(results), `ymmt-updated-pages-${sessionId || Date.now()}.csv`);
+  downloadCsvText(
+    updatedPagesCsv(results),
+    `ymmt-updated-pages-${sessionId || Date.now()}.csv`,
+  );
 }
 
 /* =========================================================
@@ -878,16 +975,38 @@ export default function ManagePages() {
   const sessionLogFetcher = useFetcher();
   const sessionCsvFetcher = useFetcher();
   const downloadedSessionCsv = useRef("");
-  const selectedSession = sessionLogFetcher.data?.session?.id === initialSelectedSession?.id && sessionLogFetcher.data.session.offset === initialSelectedSession.offset && sessionLogFetcher.data.session.fetchedAt >= initialSelectedSession.fetchedAt ? sessionLogFetcher.data.session : initialSelectedSession;
+  const polledSession = sessionLogFetcher.data?.session;
+
+  const selectedSession =
+    initialSelectedSession &&
+    polledSession &&
+    polledSession.id === initialSelectedSession.id &&
+    polledSession.offset === initialSelectedSession.offset &&
+    polledSession.fetchedAt >= initialSelectedSession.fetchedAt
+      ? polledSession
+      : (initialSelectedSession ?? null);
   const [logClock, setLogClock] = useState(Date.now());
   const refreshSessionLogs = () => {
-    if (selectedSession && sessionLogFetcher.state === "idle") sessionLogFetcher.load(`/app/manage?_sessionLogs=1&sessionId=${encodeURIComponent(selectedSession.id)}&logOffset=${selectedSession.offset}`);
+    if (selectedSession && sessionLogFetcher.state === "idle")
+      sessionLogFetcher.load(
+        `/app/manage?_sessionLogs=1&sessionId=${encodeURIComponent(selectedSession.id)}&logOffset=${selectedSession.offset}`,
+      );
   };
   useEffect(() => {
     if (!selectedSession || selectedSession.status !== "running") return;
-    const timer = setTimeout(() => { setLogClock(Date.now()); refreshSessionLogs(); }, 10000);
+    const timer = setTimeout(() => {
+      setLogClock(Date.now());
+      refreshSessionLogs();
+    }, 10000);
     return () => clearTimeout(timer);
-  }, [selectedSession?.id, selectedSession?.status, selectedSession?.offset, selectedSession?.fetchedAt, sessionLogFetcher.state, sessionLogFetcher.data]);
+  }, [
+    selectedSession?.id,
+    selectedSession?.status,
+    selectedSession?.offset,
+    selectedSession?.fetchedAt,
+    sessionLogFetcher.state,
+    sessionLogFetcher.data,
+  ]);
   useEffect(() => {
     const data = sessionCsvFetcher.data;
     if (!data?.csv || downloadedSessionCsv.current === data.requestKey) return;
@@ -1201,9 +1320,36 @@ export default function ManagePages() {
   return (
     <s-page heading="Manage YMMT Pages">
       <s-section>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "12px" }}>
-          <div><strong>Page maintenance</strong><p style={{ marginBottom: 0, color: "#616161" }}>Scan pages for missing or incorrect values and export affected pages as CSV or JSON.</p></div>
-          <Link to="/app/scan-pages" style={{ display: "inline-block", padding: "10px 16px", borderRadius: "8px", background: "#303030", color: "white", textDecoration: "none", fontWeight: 650 }}>Scan Pages</Link>
+        <div
+          style={{
+            display: "flex",
+            justifyContent: "space-between",
+            alignItems: "center",
+            flexWrap: "wrap",
+            gap: "12px",
+          }}
+        >
+          <div>
+            <strong>Page maintenance</strong>
+            <p style={{ marginBottom: 0, color: "#616161" }}>
+              Scan pages for missing or incorrect values and export affected
+              pages as CSV or JSON.
+            </p>
+          </div>
+          <Link
+            to="/app/scan-pages"
+            style={{
+              display: "inline-block",
+              padding: "10px 16px",
+              borderRadius: "8px",
+              background: "#303030",
+              color: "white",
+              textDecoration: "none",
+              fontWeight: 650,
+            }}
+          >
+            Scan Pages
+          </Link>
         </div>
       </s-section>
       <style>
@@ -2139,7 +2285,9 @@ export default function ManagePages() {
                 selected={false}
                 title="Scan Pages"
                 description="Scan YMMT pages and export pages with missing or incorrect values."
-                onClick={() => { navigate("/app/scan-pages"); }}
+                onClick={() => {
+                  navigate("/app/scan-pages");
+                }}
               />
 
               <ActionCard
@@ -2257,7 +2405,9 @@ export default function ManagePages() {
                   borderRadius: "10px",
                 }}
               >
-                {jsonSourceId ? "The vehicle metafield and page script will use the corrected values from your uploaded JSON. Other page HTML and product links will be preserved." : "Search using your corrected JSON before updating content. The existing page values will not be used as the correction source."}
+                {jsonSourceId
+                  ? "The vehicle metafield and page script will use the corrected values from your uploaded JSON. Other page HTML and product links will be preserved."
+                  : "Search using your corrected JSON before updating content. The existing page values will not be used as the correction source."}
               </div>
             )}
 
@@ -2523,10 +2673,26 @@ export default function ManagePages() {
                   Page content updated: <strong>{actionData.updated}</strong>
                   {" · "}
                   Failed: <strong>{actionData.failed}</strong>
-                  {actionData.updated > 0 && <div style={{ marginTop: "12px" }}>
-                    <button type="button" style={primaryButton} onClick={() => downloadUpdatedPagesCsv(actionData.results, actionData.sessionId)}>Download Updated Pages CSV</button>
-                    <p style={{ marginBottom: 0, fontSize: "12px" }}>Successfully updated pages from this operation only. Download before refreshing or starting another update.</p>
-                  </div>}
+                  {actionData.updated > 0 && (
+                    <div style={{ marginTop: "12px" }}>
+                      <button
+                        type="button"
+                        style={primaryButton}
+                        onClick={() =>
+                          downloadUpdatedPagesCsv(
+                            actionData.results,
+                            actionData.sessionId,
+                          )
+                        }
+                      >
+                        Download Updated Pages CSV
+                      </button>
+                      <p style={{ marginBottom: 0, fontSize: "12px" }}>
+                        Successfully updated pages from this operation only.
+                        Download before refreshing or starting another update.
+                      </p>
+                    </div>
+                  )}
                 </>
               )}
 
@@ -2608,9 +2774,17 @@ export default function ManagePages() {
 
                       <td style={cellStyle}>{session.totalPages}</td>
 
-                      <td style={cellStyle}>{selectedSession?.id === session.id ? selectedSession.successCount : session.successCount}</td>
+                      <td style={cellStyle}>
+                        {selectedSession?.id === session.id
+                          ? selectedSession.successCount
+                          : session.successCount}
+                      </td>
 
-                      <td style={cellStyle}>{selectedSession?.id === session.id ? selectedSession.failedCount : session.failedCount}</td>
+                      <td style={cellStyle}>
+                        {selectedSession?.id === session.id
+                          ? selectedSession.failedCount
+                          : session.failedCount}
+                      </td>
 
                       <td style={cellStyle}>{session.status}</td>
 
@@ -2664,61 +2838,163 @@ export default function ManagePages() {
                   gap: "10px",
                 }}
               >
-                {!selectedSession.rolledBackAt && selectedSession.status !== "running" && (
-                  <Form method="post">
-                    <input
-                      type="hidden"
-                      name="intent"
-                      value="rollback-session"
-                    />
+                {!selectedSession.rolledBackAt &&
+                  selectedSession.status !== "running" && (
+                    <Form method="post">
+                      <input
+                        type="hidden"
+                        name="intent"
+                        value="rollback-session"
+                      />
 
-                    <input
-                      type="hidden"
-                      name="sessionId"
-                      value={selectedSession.id}
-                    />
+                      <input
+                        type="hidden"
+                        name="sessionId"
+                        value={selectedSession.id}
+                      />
 
-                    <button
-                      type="submit"
+                      <button
+                        type="submit"
 
-                      onClick={(event) => {
-                        if (
-                          !window.confirm(
-                            "Rollback all reversible changes from this session?",
-                          )
-                        ) {
-                          event.preventDefault();
-                        }
-                      }}
+                        onClick={(event) => {
+                          if (
+                            !window.confirm(
+                              "Rollback all reversible changes from this session?",
+                            )
+                          ) {
+                            event.preventDefault();
+                          }
+                        }}
 
-                      style={secondaryButton}
-                    >
-                      Rollback Session
-                    </button>
-                  </Form>
-                )}
+                        style={secondaryButton}
+                      >
+                        Rollback Session
+                      </button>
+                    </Form>
+                  )}
 
                 <Link to="/app/manage">Close</Link>
               </div>
             </div>
 
             <div style={{ marginBottom: "16px" }}>
-              <strong>{selectedSession.processed.toLocaleString()} / {selectedSession.totalPages.toLocaleString()} processed ({selectedSession.progress}%)</strong>
-              <p>Successful: {selectedSession.successCount.toLocaleString()} · Failed: {selectedSession.failedCount.toLocaleString()} · Remaining: {selectedSession.remaining.toLocaleString()} · Saved status: {selectedSession.status}</p>
-              <p>Last saved activity: {selectedSession.lastActivity ? new Date(selectedSession.lastActivity).toLocaleString() : "Unavailable"}. {selectedSession.status === "running" ? "Logs refresh every 10 seconds." : "Saved logs remain available after reload."}</p>
-              {selectedSession.status === "running" && selectedSession.lastActivity && logClock - Date.parse(selectedSession.lastActivity) > 120000 && <p role="status">No new saved activity for over two minutes. The saved “running” status does not confirm that the worker is still active. Check server logs before starting another update.</p>}
-              {sessionLogFetcher.data?.error && <p role="alert">{sessionLogFetcher.data.error}</p>}
-              {sessionCsvFetcher.data?.error && <p role="alert">{sessionCsvFetcher.data.error}</p>}
+              <strong>
+                {selectedSession.processed.toLocaleString()} /{" "}
+                {selectedSession.totalPages.toLocaleString()} processed (
+                {selectedSession.progress}%)
+              </strong>
+              <p>
+                Successful: {selectedSession.successCount.toLocaleString()} ·
+                Failed: {selectedSession.failedCount.toLocaleString()} ·
+                Remaining: {selectedSession.remaining.toLocaleString()} · Saved
+                status: {selectedSession.status}
+              </p>
+              <p>
+                Last saved activity:{" "}
+                {selectedSession.lastActivity
+                  ? new Date(selectedSession.lastActivity).toLocaleString()
+                  : "Unavailable"}
+                .{" "}
+                {selectedSession.status === "running"
+                  ? "Logs refresh every 10 seconds."
+                  : "Saved logs remain available after reload."}
+              </p>
+              {selectedSession.status === "running" &&
+                selectedSession.lastActivity &&
+                logClock - Date.parse(selectedSession.lastActivity) >
+                  120000 && (
+                  <p role="status">
+                    No new saved activity for over two minutes. The saved
+                    “running” status does not confirm that the worker is still
+                    active. Check server logs before starting another update.
+                  </p>
+                )}
+              {sessionLogFetcher.data?.error && (
+                <p role="alert">{sessionLogFetcher.data.error}</p>
+              )}
+              {sessionCsvFetcher.data?.error && (
+                <p role="alert">{sessionCsvFetcher.data.error}</p>
+              )}
               <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
-                <button type="button" style={secondaryButton} disabled={sessionLogFetcher.state !== "idle"} onClick={refreshSessionLogs}>{sessionLogFetcher.state !== "idle" ? "Refreshing…" : "Refresh Logs"}</button>
-                {selectedSession.actionType === "update-content" && selectedSession.successCount > 0 && <button type="button" style={primaryButton} disabled={sessionCsvFetcher.state !== "idle"} onClick={() => sessionCsvFetcher.load(`/app/manage?_sessionCsv=1&sessionId=${encodeURIComponent(selectedSession.id)}`)}>{sessionCsvFetcher.state !== "idle" ? "Preparing CSV…" : "Download Updated Pages CSV"}</button>}
+                <button
+                  type="button"
+                  style={secondaryButton}
+                  disabled={sessionLogFetcher.state !== "idle"}
+                  onClick={refreshSessionLogs}
+                >
+                  {sessionLogFetcher.state !== "idle"
+                    ? "Refreshing…"
+                    : "Refresh Logs"}
+                </button>
+                {selectedSession.actionType === "update-content" &&
+                  selectedSession.successCount > 0 && (
+                    <button
+                      type="button"
+                      style={primaryButton}
+                      disabled={sessionCsvFetcher.state !== "idle"}
+                      onClick={() =>
+                        sessionCsvFetcher.load(
+                          `/app/manage?_sessionCsv=1&sessionId=${encodeURIComponent(selectedSession.id)}`,
+                        )
+                      }
+                    >
+                      {sessionCsvFetcher.state !== "idle"
+                        ? "Preparing CSV…"
+                        : "Download Updated Pages CSV"}
+                    </button>
+                  )}
               </div>
-              <div role="log" aria-live="polite" aria-label="Saved page update logs" style={{ background: "#080808", color: "#eee", borderRadius: "10px", padding: "16px", marginTop: "14px", maxHeight: "400px", overflow: "auto", fontFamily: "monospace", fontSize: "12px", lineHeight: 1.8 }}>
-                <div>[SESSION] {selectedSession.actionType} · {selectedSession.status}</div>
-                {selectedSession.logs.length === 0 && <div>[WAITING] No per-page results have been saved yet.</div>}
-                {selectedSession.logs.map((entry) => <div key={entry.id} style={{ color: entry.status === "failed" ? "#ff9b9b" : entry.status === "success" ? "#9ee6b1" : "#eee" }}>[{entry.time ? new Date(entry.time).toLocaleTimeString() : "SAVED"}] [{String(entry.status || "pending").toUpperCase()}] {entry.handle || entry.id}{entry.message ? ` — ${entry.message}` : ""}{entry.rolledBackAt ? " — rolled back" : ""}</div>)}
+              <div
+                role="log"
+                aria-live="polite"
+                aria-label="Saved page update logs"
+                style={{
+                  background: "#080808",
+                  color: "#eee",
+                  borderRadius: "10px",
+                  padding: "16px",
+                  marginTop: "14px",
+                  maxHeight: "400px",
+                  overflow: "auto",
+                  fontFamily: "monospace",
+                  fontSize: "12px",
+                  lineHeight: 1.8,
+                }}
+              >
+                <div>
+                  [SESSION] {selectedSession.actionType} ·{" "}
+                  {selectedSession.status}
+                </div>
+                {selectedSession.logs.length === 0 && (
+                  <div>[WAITING] No per-page results have been saved yet.</div>
+                )}
+                {selectedSession.logs.map((entry) => (
+                  <div
+                    key={entry.id}
+                    style={{
+                      color:
+                        entry.status === "failed"
+                          ? "#ff9b9b"
+                          : entry.status === "success"
+                            ? "#9ee6b1"
+                            : "#eee",
+                    }}
+                  >
+                    [
+                    {entry.time
+                      ? new Date(entry.time).toLocaleTimeString()
+                      : "SAVED"}
+                    ] [{String(entry.status || "pending").toUpperCase()}]{" "}
+                    {entry.handle || entry.id}
+                    {entry.message ? ` — ${entry.message}` : ""}
+                    {entry.rolledBackAt ? " — rolled back" : ""}
+                  </div>
+                ))}
               </div>
-              <p style={{ fontSize: "12px" }}>Latest 100 saved entries shown above. CSV uses recorded post-update values; unavailable values are left blank.</p>
+              <p style={{ fontSize: "12px" }}>
+                Latest 100 saved entries shown above. CSV uses recorded
+                post-update values; unavailable values are left blank.
+              </p>
             </div>
 
             <div
@@ -2779,9 +3055,26 @@ export default function ManagePages() {
               </table>
             </div>
             <div style={{ display: "flex", gap: "12px", marginTop: "12px" }}>
-              {selectedSession.offset > 0 && <Link to={`/app/manage?sessionId=${selectedSession.id}&logOffset=${Math.max(0, selectedSession.offset - 50)}`}>Previous 50</Link>}
-              {selectedSession.offset + selectedSession.changes.length < selectedSession.changeCount && <Link to={`/app/manage?sessionId=${selectedSession.id}&logOffset=${selectedSession.offset + 50}`}>Next 50</Link>}
-              <span>{selectedSession.changeCount ? `${selectedSession.offset + 1}–${selectedSession.offset + selectedSession.changes.length} of ${selectedSession.changeCount} saved results` : "No saved results yet"}</span>
+              {selectedSession.offset > 0 && (
+                <Link
+                  to={`/app/manage?sessionId=${selectedSession.id}&logOffset=${Math.max(0, selectedSession.offset - 50)}`}
+                >
+                  Previous 50
+                </Link>
+              )}
+              {selectedSession.offset + selectedSession.changes.length <
+                selectedSession.changeCount && (
+                <Link
+                  to={`/app/manage?sessionId=${selectedSession.id}&logOffset=${selectedSession.offset + 50}`}
+                >
+                  Next 50
+                </Link>
+              )}
+              <span>
+                {selectedSession.changeCount
+                  ? `${selectedSession.offset + 1}–${selectedSession.offset + selectedSession.changes.length} of ${selectedSession.changeCount} saved results`
+                  : "No saved results yet"}
+              </span>
             </div>
           </s-section>
         )}

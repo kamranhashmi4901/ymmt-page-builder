@@ -9,7 +9,10 @@ function isFlatModel(obj) {
 
   const keys = Object.keys(obj);
 
-  return keys.length > 0 && keys.every((key) => META_KEYS.has(key));
+  return (
+    keys.some((key) => META_KEYS.has(key)) &&
+    keys.every((key) => META_KEYS.has(key) || isObject(obj[key]))
+  );
 }
 
 function countManufacturer(stats, manufacturer) {
@@ -78,7 +81,8 @@ export function parseYMMT(raw) {
           stats.withoutTrim++;
           countManufacturer(stats, entry.manufacturer);
 
-          continue;
+          if (Object.keys(trimData).every((key) => META_KEYS.has(key)))
+            continue;
         }
 
         // EKR-style:

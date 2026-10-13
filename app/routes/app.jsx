@@ -19,6 +19,9 @@ export default function App() {
         <s-link href="/app">Dashboard</s-link>
         <s-link href="/app/upload">Create YMMT Pages</s-link>
         <s-link href="/app/manage">Manage Pages</s-link>
+        <s-link href="/app/scan-pages">Scan Pages</s-link>
+        <s-link href="/app/change-sessions">Recent Change Sessions</s-link>
+        <s-link href="/app/page-updates">Page Update Jobs</s-link>
         <s-link href="/app/seo">SEO Meta</s-link>
         <s-link href="/app/google-feed">Google Feed</s-link>
       </s-app-nav>

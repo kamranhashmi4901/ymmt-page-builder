@@ -1,4 +1,5 @@
 import db from "../db.server";
+import { estimateRemainingSeconds, formatEstimatedTime } from "./progress-eta";
 
 import { buildYMMTPageHandle, buildYMMTPageTitle } from "./ymmt-pages";
 
@@ -102,7 +103,7 @@ export async function createYMMTJob({ shop, uploadId }) {
 ========================================================= */
 
 export async function getYMMTJob({ jobId, shop }) {
-  return db.ymmtJob.findFirst({
+  const job = await db.ymmtJob.findFirst({
     where: {
       id: jobId,
 
@@ -112,13 +113,16 @@ export async function getYMMTJob({ jobId, shop }) {
     include: {
       logs: {
         orderBy: {
-          createdAt: "asc",
+          createdAt: "desc",
         },
 
         take: 100,
       },
     },
   });
+  if (!job) return null;
+  const checkLog = (job.logs || []).find((log) => log.message.startsWith("Duplicate check:") || log.message.startsWith("Duplicate check complete."));
+  return { ...job, duplicateCheckEstimate: checkLog?.message.startsWith("Duplicate check:") ? checkLog.message : "", logs: [...(job.logs || [])].reverse() };
 }
 
 /* =========================================================
@@ -353,10 +357,27 @@ async function processJob({ jobId, shop, admin }) {
       buildPageProposals(record, upload).map((proposal) => proposal.handle),
     );
 
+    const lookupStartedAt = Date.now();
     const existingHandles = await getExistingPageHandles(
       admin,
       candidateHandles,
+      {
+        onEvent: async (level, message) => {
+          let text = message;
+          if (level === "progress") {
+            const counts = /^Checked (\d+)\/(\d+) candidate handles/.exec(message);
+            if (counts) {
+              const processed = Number(counts[1]), total = Number(counts[2]);
+              const eta = estimateRemainingSeconds({ processed, total, elapsedMs: Date.now() - lookupStartedAt });
+              text = `Duplicate check: ${processed}/${total} handles checked. Estimated remaining: ${formatEstimatedTime(eta)}.`;
+            }
+          }
+          await logJob({ jobId, level: ["throttle", "wait"].includes(level) ? "warning" : "info", message: text });
+        },
+      },
     );
+
+    await logJob({ jobId, message: "Duplicate check complete. Beginning page creation." });
 
     /*
      * Resume safety.

@@ -7,7 +7,8 @@ import {
   useFetcher,
   useLoaderData,
   useNavigation,
-  useNavigate,
+  useSearchParams,
+  redirect,
 } from "react-router";
 
 import { authenticate } from "../shopify.server";
@@ -16,7 +17,6 @@ import {
   deleteShopifyPage,
   getShopifyPageSnapshot,
   updateYMMTProductHandle,
-  updateYMMTPageContent,
   restoreShopifyPageSnapshot,
   recreateShopifyPageFromSnapshot,
 } from "../lib/shopify-manage-pages.server";
@@ -24,7 +24,6 @@ import {
 import { parseYMMT } from "../lib/ymmt-parser.server";
 import {
   saveManageJsonSource,
-  loadManageJsonSource,
 } from "../lib/ymmt-manage-json-source.server";
 
 import {
@@ -33,8 +32,8 @@ import {
   markPageChangeSuccess,
   markPageChangeFailed,
   completeActionSession,
-  getRecentActionSessions,
   getActionSession,
+  getActionSessionHeader,
   markChangeRolledBack,
   markSessionRolledBack,
 } from "../lib/page-change-log.server";
@@ -42,7 +41,11 @@ import {
 import {
   createYMMTPageSearchJob,
   startYMMTPageSearchJob,
+  getYMMTSearchContext,
+  attachYMMTSearchSource,
 } from "../lib/ymmt-page-search-jobs.server";
+
+import { createPageUpdateJob, updatePlan } from "../lib/page-update-jobs.server";
 
 function sessionChanges(session) {
   return Array.isArray(session?.changes) ? session.changes : [];
@@ -131,16 +134,22 @@ function savedSessionCsvRows(session) {
 ========================================================= */
 
 export const loader = async ({ request }) => {
-  const { admin, session } = await authenticate.admin(request);
+  const { session } = await authenticate.admin(request);
 
   const url = new URL(request.url);
+  const selectedId = url.searchParams.get("sessionId");
+  if (selectedId && !url.searchParams.has("_sessionLogs") && !url.searchParams.has("_sessionCsv")) {
+    const header = await getActionSessionHeader(session.shop, selectedId);
+    if (header?.actionType === "update-content" && url.searchParams.get("sessionMode") !== "rollback") return redirect(`/app/page-update/${encodeURIComponent(selectedId)}`);
+  }
+  const searchContext = url.searchParams.get("searchJobId") ? await getYMMTSearchContext({ shop: session.shop, jobId: url.searchParams.get("searchJobId") }) : null;
   if (
     url.searchParams.has("_sessionLogs") ||
     url.searchParams.has("_sessionCsv")
   ) {
     const id = url.searchParams.get("sessionId") || "";
     try {
-      const sessionLog = id ? await getActionSession(session.shop, id) : null;
+      const sessionLog = id ? await getActionSession(session.shop, id, { summaryOnly: !url.searchParams.has("_sessionCsv") }) : null;
       if (!sessionLog)
         return {
           session: null,
@@ -197,7 +206,6 @@ export const loader = async ({ request }) => {
   // do not block the route loader or stop after the first 2,000 pages.
   const pages = [];
 
-  const recentSessions = await getRecentActionSessions(session.shop, 10);
 
   const sessionId = url.searchParams.get("sessionId") || "";
 
@@ -205,7 +213,7 @@ export const loader = async ({ request }) => {
 
   if (sessionId) {
     selectedSession = savedSessionView(
-      await getActionSession(session.shop, sessionId),
+      await getActionSession(session.shop, sessionId, { summaryOnly: true }),
       url.searchParams.get("logOffset"),
     );
   }
@@ -214,9 +222,10 @@ export const loader = async ({ request }) => {
     shop: session.shop,
     pages,
     filters,
-    recentSessions,
     hasFilters,
     selectedSession,
+    searchContext,
+    requestKey: crypto.randomUUID(),
   };
 };
 
@@ -232,6 +241,16 @@ export const action = async ({ request }) => {
   const formData = await request.formData();
 
   const intent = String(formData.get("intent") || "");
+  if (intent === "attach-json-source") {
+    try {
+      const file = formData.get("ymmtFile");
+      if (!file || typeof file.text !== "function" || file.size > 20 * 1024 * 1024) throw new Error("Choose a corrected JSON file smaller than 20 MB.");
+      const parsed = parseYMMT(JSON.parse(await file.text()));
+      const jsonSourceId = await saveManageJsonSource(shop, parsed.entries, file.name);
+      await attachYMMTSearchSource({ shop, jobId: String(formData.get("searchJobId") || ""), jsonSourceId });
+      return { success: true, intent, jsonSourceId };
+    } catch (error) { return { success: false, error: error.message }; }
+  }
 
   /* -------------------------------------------------------
      ROLLBACK
@@ -256,7 +275,7 @@ export const action = async ({ request }) => {
       };
     }
 
-    if (actionSession.status === "running")
+    if (actionSession.status === "running" || updatePlan(actionSession)?.lease?.until > Date.now())
       return {
         success: false,
         error: "Wait for the running session to finish before rolling back.",
@@ -476,6 +495,7 @@ export const action = async ({ request }) => {
         mode: "json",
         fileName: file.name,
         records: parsed.entries,
+        jsonSourceId,
       });
 
       /*
@@ -517,7 +537,12 @@ export const action = async ({ request }) => {
      ALL OTHER ACTIONS REQUIRE PAGES
   ------------------------------------------------------- */
 
-  const pageIds = formData.getAll("pageIds").map(String);
+  let pageIds;
+  try {
+    const encoded = formData.get("pageIdsJson");
+    pageIds = encoded ? JSON.parse(String(encoded)) : formData.getAll("pageIds").map(String);
+    if (!Array.isArray(pageIds) || pageIds.some((id) => typeof id !== "string")) throw new Error("Invalid page selection.");
+  } catch { return { success: false, error: "Invalid page selection. Refresh the saved search and select pages again." }; }
 
   if (!pageIds.length) {
     return {
@@ -658,97 +683,10 @@ export const action = async ({ request }) => {
   ------------------------------------------------------- */
 
   if (intent === "update-content") {
-    let jsonSource;
     try {
-      jsonSource = await loadManageJsonSource(
-        shop,
-        String(formData.get("jsonSourceId") || ""),
-      );
-    } catch (error) {
-      return { success: false, intent, error: error.message };
-    }
-    const actionSession = await createActionSession({
-      shop,
-
-      actionType: "update-content",
-
-      totalPages: pageIds.length,
-    });
-
-    for (const pageId of pageIds) {
-      let changeLog = null;
-
-      try {
-        const beforeSnapshot = await getShopifyPageSnapshot(admin, pageId);
-
-        changeLog = await logPageBeforeChange({
-          sessionId: actionSession.id,
-
-          shopifyPageId: pageId,
-
-          handle: beforeSnapshot.handle || "",
-
-          action: "update-content",
-
-          beforeData: beforeSnapshot,
-        });
-
-        const updatedPage = await updateYMMTPageContent(admin, pageId, {
-          jsonSource,
-        });
-
-        const afterSnapshot = await getShopifyPageSnapshot(admin, pageId);
-
-        await markPageChangeSuccess({
-          changeId: changeLog.id,
-
-          afterData: afterSnapshot,
-        });
-
-        results.push({
-          pageId,
-
-          title: afterSnapshot.title,
-
-          handle: afterSnapshot.handle,
-
-          status: "updated",
-          vehicle: JSON.parse(updatedPage.vehicle.value),
-        });
-      } catch (error) {
-        if (changeLog) {
-          await markPageChangeFailed({
-            changeId: changeLog.id,
-
-            error,
-          });
-        }
-
-        results.push({
-          pageId,
-
-          status: "failed",
-
-          message: error.message || "Unable to update page content.",
-        });
-      }
-    }
-
-    await completeActionSession(actionSession.id);
-
-    return {
-      success: true,
-
-      intent,
-
-      sessionId: actionSession.id,
-
-      updated: results.filter((result) => result.status === "updated").length,
-
-      failed: results.filter((result) => result.status === "failed").length,
-
-      results,
-    };
+      const job = await createPageUpdateJob(shop, pageIds, String(formData.get("jsonSourceId") || ""), String(formData.get("searchJobId") || ""), String(formData.get("requestKey") || ""));
+      return redirect(`/app/page-update/${job.id}?start=1`);
+    } catch (error) { return { success: false, intent, error: error.message || "Unable to create the saved update job." }; }
   }
 
   /* -------------------------------------------------------
@@ -963,13 +901,14 @@ const cellStyle = {
 ========================================================= */
 
 export default function ManagePages() {
-  const navigate = useNavigate();
+  const [, setSearchParams] = useSearchParams();
+  const handledSearch = useRef("");
+  const [resultOffset, setResultOffset] = useState(0);
+  const [showResultsTable, setShowResultsTable] = useState(false);
   const {
-    shop,
-    pages,
     filters,
-    recentSessions,
-    hasFilters,
+    searchContext,
+    requestKey,
     selectedSession: initialSelectedSession,
   } = useLoaderData();
   const sessionLogFetcher = useFetcher();
@@ -1026,7 +965,7 @@ export default function ManagePages() {
 
   const [selectedAction, setSelectedAction] = useState("");
 
-  const [searchMode, setSearchMode] = useState("manual");
+  const [searchMode, setSearchMode] = useState(searchContext?.mode || "manual");
 
   const [selectedIds, setSelectedIds] = useState(new Set());
 
@@ -1042,14 +981,22 @@ export default function ManagePages() {
      SEARCH JOB
   ------------------------------------------------------- */
 
-  const [searchJobId, setSearchJobId] = useState(null);
-  const [jsonSourceId, setJsonSourceId] = useState("");
+  const [searchJobId, setSearchJobId] = useState(searchContext?.jobId || null);
+  useEffect(() => { setShowResultsTable(false); setResultOffset(0); }, [searchJobId]);
+  const [jsonSourceId, setJsonSourceId] = useState(searchContext?.jsonSourceId || "");
   const [searchLogs, setSearchLogs] = useState([]);
 
-  const searchJob = searchFetcher.data;
+  const searchJob = searchFetcher.data?.id === searchJobId ? searchFetcher.data : null;
+  useEffect(() => {
+    if (!searchContext?.jobId) return;
+    setSearchJobId(searchContext.jobId); setSearchMode(searchContext.mode); setJsonSourceId(searchContext.jsonSourceId);
+  }, [searchContext]);
 
   useEffect(() => {
     const data = manualSearchFetcher.data;
+    if (!data?.jobId || handledSearch.current === data.jobId) return;
+    handledSearch.current = data.jobId; setResultOffset(0);
+    setSearchParams((previous) => { const params = new URLSearchParams(previous); params.set("searchJobId", data.jobId); params.delete("sessionId"); params.delete("logOffset"); return params; });
 
     if (!data?.success || data.intent !== "manual-search-start") {
       return;
@@ -1067,9 +1014,13 @@ export default function ManagePages() {
         .map(([key, value]) => `${key}=${value}`)
         .join(", ")}`,
     ]);
-  }, [manualSearchFetcher.data]);
+  }, [manualSearchFetcher.data, setSearchParams]);
   useEffect(() => {
     const data = jsonSearchFetcher.data;
+    if (data?.success && data.intent === "attach-json-source") { setJsonSourceId(data.jsonSourceId); return; }
+    if (!data?.jobId || handledSearch.current === data.jobId) return;
+    handledSearch.current = data.jobId; setResultOffset(0);
+    setSearchParams((previous) => { const params = new URLSearchParams(previous); params.set("searchJobId", data.jobId); params.delete("sessionId"); params.delete("logOffset"); return params; });
 
     if (!data?.success || data.intent !== "json-search-start") {
       return;
@@ -1083,7 +1034,7 @@ export default function ManagePages() {
     setSearchLogs([
       `[START] JSON search started for ${data.fileName || "uploaded file"}.`,
     ]);
-  }, [jsonSearchFetcher.data]);
+  }, [jsonSearchFetcher.data, setSearchParams]);
 
   useEffect(() => {
     const message = searchJob?.message;
@@ -1111,27 +1062,13 @@ export default function ManagePages() {
    * Poll persistent search job
    * every 1.5 seconds.
    */
+  const { load: loadSearchStatus, state: searchStatusState } = searchFetcher;
+  const searchStatus = searchJob?.status;
   useEffect(() => {
-    if (!searchJobId) {
-      return;
-    }
-
-    if (["completed", "failed"].includes(searchJob?.status)) {
-      return;
-    }
-
-    const loadStatus = () => {
-      if (searchFetcher.state !== "loading") {
-        searchFetcher.load(`/app/search-status/${searchJobId}`);
-      }
-    };
-
-    loadStatus();
-
-    const timer = setInterval(loadStatus, 1500);
-
-    return () => clearInterval(timer);
-  }, [searchJobId, searchJob?.status]);
+    if (!searchJobId || ["completed", "failed"].includes(searchStatus) || searchStatusState !== "idle") return;
+    const timer = setTimeout(() => loadSearchStatus(`/app/search-status/${searchJobId}`), 1500);
+    return () => clearTimeout(timer);
+  }, [searchJobId, searchStatus, searchStatusState, loadSearchStatus]);
 
   const completedSearchPages =
     searchJob?.status === "completed" ? searchJob.pages || [] : [];
@@ -1190,6 +1127,8 @@ export default function ManagePages() {
   };
 
   const toggleAll = () => {
+    setShowResultsTable(!allSelected);
+    setResultOffset(0);
     if (allSelected) {
       setSelectedIds(new Set());
 
@@ -1204,6 +1143,7 @@ export default function ManagePages() {
       return;
     }
 
+    setShowResultsTable(false);
     setSearchMode(mode);
 
     setSelectedIds(new Set());
@@ -1319,39 +1259,16 @@ export default function ManagePages() {
 
   return (
     <s-page heading="Manage YMMT Pages">
-      <s-section>
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            flexWrap: "wrap",
-            gap: "12px",
-          }}
-        >
-          <div>
-            <strong>Page maintenance</strong>
-            <p style={{ marginBottom: 0, color: "#616161" }}>
-              Scan pages for missing or incorrect values and export affected
-              pages as CSV or JSON.
-            </p>
-          </div>
-          <Link
-            to="/app/scan-pages"
-            style={{
-              display: "inline-block",
-              padding: "10px 16px",
-              borderRadius: "8px",
-              background: "#303030",
-              color: "white",
-              textDecoration: "none",
-              fontWeight: 650,
-            }}
-          >
-            Scan Pages
-          </Link>
-        </div>
-      </s-section>
+      <p><Link to="/app/page-updates">Page Update Jobs →</Link></p>
+      {searchContext?.mode === "json" && !jsonSourceId && <s-section heading="Attach correction data to this saved search">
+        <p>Your found pages are retained. Attach the corrected JSON to enable updates without rerunning the search.</p>
+        <jsonSearchFetcher.Form method="post" encType="multipart/form-data">
+          <input type="hidden" name="intent" value="attach-json-source" />
+          <input type="hidden" name="searchJobId" value={searchJobId || ""} />
+          <input type="file" name="ymmtFile" accept=".json,application/json" required />
+          <button type="submit" style={primaryButton}>Attach Corrected JSON</button>
+        </jsonSearchFetcher.Form>
+      </s-section>}
       <style>
         {`
 
@@ -2066,7 +1983,7 @@ export default function ManagePages() {
 
                     style={primaryButton}
                   >
-                    {allSelected ? "Deselect All" : "Select All"}
+                    {allSelected ? "Deselect All" : "Select All Matching Pages"}
                   </button>
                 )}
               </div>
@@ -2074,6 +1991,7 @@ export default function ManagePages() {
 
             {resultPages.length > 0 ? (
               <>
+                {showResultsTable && (<>
                 <div
                   style={{
                     overflowX: "auto",
@@ -2125,7 +2043,7 @@ export default function ManagePages() {
                     </thead>
 
                     <tbody>
-                      {resultPages.map((page) => (
+                      {resultPages.slice(resultOffset, resultOffset + 50).map((page) => (
                         <tr key={page.id}>
                           <td style={cellStyle}>
                             <input
@@ -2177,6 +2095,7 @@ export default function ManagePages() {
                     </tbody>
                   </table>
                 </div>
+                </>)}
 
                 <div
                   style={{
@@ -2191,7 +2110,12 @@ export default function ManagePages() {
                     gap: "12px",
                   }}
                 >
-                  <span>{selectedIds.size} selected</span>
+                  <span>{selectedIds.size.toLocaleString()} selected</span>
+                  {showResultsTable && <>
+                    <span>Showing {resultOffset + 1}–{Math.min(resultOffset + 50, resultPages.length)} of {resultPages.length}</span>
+                    <button type="button" style={secondaryButton} disabled={resultOffset === 0} onClick={() => setResultOffset(Math.max(0, resultOffset - 50))}>Previous 50</button>
+                    <button type="button" style={secondaryButton} disabled={resultOffset + 50 >= resultPages.length} onClick={() => setResultOffset(resultOffset + 50)}>Next 50</button>
+                  </>}
 
                   <button
                     type="button"
@@ -2282,15 +2206,6 @@ export default function ManagePages() {
               />
 
               <ActionCard
-                selected={false}
-                title="Scan Pages"
-                description="Scan YMMT pages and export pages with missing or incorrect values."
-                onClick={() => {
-                  navigate("/app/scan-pages");
-                }}
-              />
-
-              <ActionCard
                 selected={selectedAction === "delete"}
 
                 danger
@@ -2362,7 +2277,7 @@ export default function ManagePages() {
                 color: "#616161",
               }}
             >
-              {selectedIds.size} pages selected
+              {selectedIds.size} pages selected (preview shows at most 50; all selected IDs are queued)
             </div>
 
             {selectedAction === "update-product" && (
@@ -2447,25 +2362,11 @@ export default function ManagePages() {
               </div>
             )}
 
-            <SelectedPagesTable
-              pages={resultPages}
-
-              selectedIds={selectedIds}
-            />
-
             <Form method="post">
               <input type="hidden" name="jsonSourceId" value={jsonSourceId} />
-              {[...selectedIds].map((pageId) => (
-                <input
-                  key={pageId}
-
-                  type="hidden"
-
-                  name="pageIds"
-
-                  value={pageId}
-                />
-              ))}
+              <input type="hidden" name="pageIdsJson" value={JSON.stringify([...selectedIds])} />
+              <input type="hidden" name="searchJobId" value={searchJobId || ""} />
+              <input type="hidden" name="requestKey" value={requestKey} />
 
               <input
                 type="hidden"
@@ -2536,7 +2437,7 @@ export default function ManagePages() {
                     : selectedAction === "delete"
                       ? `Delete ${selectedIds.size} Pages`
                       : selectedAction === "update-content"
-                        ? "Confirm Content Update"
+                        ? "Start Page Update Job"
                         : "Confirm Product Update"}
                 </button>
               </div>
@@ -2714,94 +2615,6 @@ export default function ManagePages() {
               )}
             </div>
           )}
-
-        {/* =================================================
-            RECENT CHANGE SESSIONS
-        ================================================= */}
-
-        <s-section>
-          <strong>Recent Change Sessions</strong>
-
-          {recentSessions.length > 0 ? (
-            <div
-              style={{
-                marginTop: "12px",
-
-                overflowX: "auto",
-
-                border: "1px solid #e3e3e3",
-
-                borderRadius: "10px",
-              }}
-            >
-              <table
-                style={{
-                  width: "100%",
-
-                  borderCollapse: "collapse",
-                }}
-              >
-                <thead>
-                  <tr>
-                    <th align="left" style={headerStyle}>
-                      Date
-                    </th>
-
-                    <th align="left" style={headerStyle}>
-                      Action
-                    </th>
-
-                    <th style={headerStyle}>Pages</th>
-
-                    <th style={headerStyle}>Success</th>
-
-                    <th style={headerStyle}>Failed</th>
-
-                    <th style={headerStyle}>Status</th>
-
-                    <th style={headerStyle}>Actions</th>
-                  </tr>
-                </thead>
-
-                <tbody>
-                  {recentSessions.map((session) => (
-                    <tr key={session.id}>
-                      <td style={cellStyle}>
-                        {new Date(session.createdAt).toLocaleString()}
-                      </td>
-
-                      <td style={cellStyle}>{session.actionType}</td>
-
-                      <td style={cellStyle}>{session.totalPages}</td>
-
-                      <td style={cellStyle}>
-                        {selectedSession?.id === session.id
-                          ? selectedSession.successCount
-                          : session.successCount}
-                      </td>
-
-                      <td style={cellStyle}>
-                        {selectedSession?.id === session.id
-                          ? selectedSession.failedCount
-                          : session.failedCount}
-                      </td>
-
-                      <td style={cellStyle}>{session.status}</td>
-
-                      <td style={cellStyle}>
-                        <Link to={`/app/manage?sessionId=${session.id}`}>
-                          View Changes
-                        </Link>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          ) : (
-            <s-paragraph>No change sessions recorded yet.</s-paragraph>
-          )}
-        </s-section>
 
         {/* =================================================
             SESSION DETAIL
@@ -3360,77 +3173,5 @@ function ActionCard({ title, description, selected, danger = false, onClick }) {
         {description}
       </div>
     </button>
-  );
-}
-
-function SelectedPagesTable({ pages, selectedIds }) {
-  const selectedPages = pages.filter((page) => selectedIds.has(page.id));
-
-  return (
-    <div
-      style={{
-        overflowX: "auto",
-
-        border: "1px solid #e3e3e3",
-
-        borderRadius: "10px",
-
-        marginBottom: "16px",
-      }}
-    >
-      <table
-        style={{
-          width: "100%",
-
-          borderCollapse: "collapse",
-        }}
-      >
-        <thead>
-          <tr>
-            <th align="left" style={headerStyle}>
-              Page
-            </th>
-
-            <th align="left" style={headerStyle}>
-              Vehicle
-            </th>
-
-            <th align="left" style={headerStyle}>
-              Product
-            </th>
-          </tr>
-        </thead>
-
-        <tbody>
-          {selectedPages.map((page) => (
-            <tr key={page.id}>
-              <td style={cellStyle}>
-                <strong>{page.title}</strong>
-
-                <div
-                  style={{
-                    fontSize: "12px",
-
-                    color: "#616161",
-                  }}
-                >
-                  {page.handle}
-                </div>
-              </td>
-
-              <td style={cellStyle}>
-                {[page.year, page.make, page.model, page.trim]
-                  .filter(Boolean)
-                  .join(" ") || "—"}
-              </td>
-
-              <td style={cellStyle}>
-                {page.productHandle || page.sourceProductHandle || "—"}
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
   );
 }

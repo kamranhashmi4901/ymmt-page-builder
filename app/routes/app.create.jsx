@@ -14,21 +14,8 @@ import { authenticate } from "../shopify.server";
 
 import { getYMMTUpload } from "../lib/ymmt-uploads.server";
 
-import { getExistingPageHandles } from "../lib/shopify-pages.server";
-
-import { buildYMMTPageHandle } from "../lib/ymmt-pages";
-
-function buildRecordHandles(record, upload) {
-  const sourceProducts =
-    upload.sourceProducts?.length > 0 ? upload.sourceProducts : [null];
-
-  return sourceProducts.map((product) =>
-    buildYMMTPageHandle(record, product?.handle || null),
-  );
-}
-
 export const loader = async ({ request }) => {
-  const { session, admin } = await authenticate.admin(request);
+  const { session } = await authenticate.admin(request);
 
   const url = new URL(request.url);
 
@@ -60,38 +47,13 @@ export const loader = async ({ request }) => {
 
       duplicate: false,
     },
+    select: { id: true },
   });
 
-  /*
-   * Build only the final Shopify handles
-   * that this creation batch needs.
-   */
-  const candidateHandles = selectedRecords.flatMap((record) =>
-    buildRecordHandles(record, upload),
-  );
-
-  /*
-   * Targeted duplicate lookup.
-   *
-   * No full-store page scan.
-   */
-  const existingHandles = await getExistingPageHandles(admin, candidateHandles);
-
-  let pageCount = 0;
-
-  let skippedExistingCount = 0;
-
-  for (const record of selectedRecords) {
-    const handles = buildRecordHandles(record, upload);
-
-    for (const handle of handles) {
-      if (existingHandles.has(handle)) {
-        skippedExistingCount += 1;
-      } else {
-        pageCount += 1;
-      }
-    }
-  }
+  // Confirmation uses saved selection counts. The creation job performs the
+  // fresh duplicate check after opening its progress screen.
+  const productCount = upload.sourceProducts?.length || 1;
+  const pageCount = selectedRecords.length * productCount;
 
   return {
     upload,
@@ -99,11 +61,7 @@ export const loader = async ({ request }) => {
     selectedCount: selectedRecords.length,
 
     pageCount,
-
-    skippedExistingCount,
-
-    productCount:
-      upload.sourceProducts?.length > 0 ? upload.sourceProducts.length : 1,
+    productCount,
   };
 };
 
@@ -193,7 +151,6 @@ export default function CreatePages() {
     upload,
     selectedCount,
     pageCount,
-    skippedExistingCount,
     productCount,
   } = useLoaderData();
 
@@ -364,7 +321,7 @@ export default function CreatePages() {
                 marginBottom: "5px",
               }}
             >
-              New Pages to Create
+              Proposed Pages
             </div>
 
             <div
@@ -375,30 +332,6 @@ export default function CreatePages() {
               }}
             >
               {pageCount}
-            </div>
-          </div>
-
-          <div style={summaryCardStyle}>
-            <div
-              style={{
-                color: "#616161",
-
-                fontSize: "13px",
-
-                marginBottom: "5px",
-              }}
-            >
-              Existing Pages Skipped
-            </div>
-
-            <div
-              style={{
-                fontSize: "28px",
-
-                fontWeight: "700",
-              }}
-            >
-              {skippedExistingCount}
             </div>
           </div>
 
@@ -428,6 +361,8 @@ export default function CreatePages() {
             </div>
           </div>
         </div>
+
+        <p style={{ color: "#616161", margin: 0 }}>This is the proposed page count. The creation job checks existing handles and reports any skipped duplicates in its logs.</p>
 
         <s-section>
           <strong>Products</strong>
@@ -546,7 +481,7 @@ export default function CreatePages() {
             >
               {isCreating
                 ? "Starting Creation Job..."
-                : `Create ${pageCount} Page${pageCount === 1 ? "" : "s"}`}
+                : `Start Creation (${pageCount} proposed page${pageCount === 1 ? "" : "s"})`}
             </button>
           </Form>
         </div>

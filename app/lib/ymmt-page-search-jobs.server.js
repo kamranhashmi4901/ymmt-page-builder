@@ -13,6 +13,7 @@ export async function createYMMTPageSearchJob({
   records = [],
   mode = "json",
   filters = {},
+  jsonSourceId = "",
 }) {
   const safeRecords = Array.isArray(records) ? records : [];
 
@@ -28,6 +29,7 @@ export async function createYMMTPageSearchJob({
     mode,
     filters,
     records: safeRecords,
+    jsonSourceId,
   };
 
   return db.ymmtPageSearchJob.create({
@@ -201,4 +203,42 @@ async function processSearchJob({ jobId, shop, admin }) {
       },
     });
   }
+}
+
+export async function getYMMTSearchContext({ jobId, shop }) {
+  const job = await db.ymmtPageSearchJob.findFirst({
+    where: { id: jobId, shop },
+    select: { id: true, recordsJson: true, fileName: true },
+  });
+  if (!job) return null;
+  let data;
+  try {
+    data = JSON.parse(job.recordsJson || "[]");
+  } catch {
+    return null;
+  }
+  return {
+    jobId: job.id,
+    mode: Array.isArray(data) ? "json" : data.mode || "json",
+    jsonSourceId: data.jsonSourceId || "",
+    filters: data.filters || {},
+    fileName: job.fileName,
+  };
+}
+export async function attachYMMTSearchSource({ jobId, shop, jsonSourceId }) {
+  const job = await db.ymmtPageSearchJob.findFirst({
+    where: { id: jobId, shop },
+    select: { id: true, recordsJson: true },
+  });
+  if (!job) throw new Error("Saved search not found for this store.");
+  const parsed = JSON.parse(job.recordsJson || "[]");
+  const payload = Array.isArray(parsed)
+    ? { mode: "json", records: parsed, filters: {} }
+    : parsed;
+  if (payload.mode !== "json")
+    throw new Error("Attach correction JSON to a JSON search.");
+  await db.ymmtPageSearchJob.update({
+    where: { id: job.id },
+    data: { recordsJson: JSON.stringify({ ...payload, jsonSourceId }) },
+  });
 }

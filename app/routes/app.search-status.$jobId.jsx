@@ -21,6 +21,7 @@ export const loader = async ({ request, params }) => {
   let missingRecords = [];
   let searchMode = "json";
   let filters = {};
+  let jsonSourceId = "";
 
   try {
     const stored = JSON.parse(job.recordsJson || "[]");
@@ -28,6 +29,7 @@ export const loader = async ({ request, params }) => {
     if (!Array.isArray(stored)) {
       searchMode = stored?.mode || "json";
       filters = stored?.filters || {};
+      jsonSourceId = stored?.jsonSourceId || "";
     }
   } catch {
     searchMode = "json";
@@ -56,6 +58,7 @@ export const loader = async ({ request, params }) => {
     fileName: job.fileName,
 
     searchMode,
+    jsonSourceId,
 
     filters,
 

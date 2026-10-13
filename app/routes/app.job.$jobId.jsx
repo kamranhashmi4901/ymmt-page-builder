@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Form,
   Link,
@@ -8,6 +8,7 @@ import {
 } from "react-router";
 
 import { authenticate } from "../shopify.server";
+import { estimateRemainingSeconds, formatEstimatedTime } from "../lib/progress-eta";
 
 import {
   cancelYMMTJob,
@@ -114,6 +115,18 @@ export default function JobProgress() {
 
   const [downloadingCsv, setDownloadingCsv] = useState(false);
   const [downloadError, setDownloadError] = useState("");
+  const etaSample = useRef(null);
+  const [estimatedSeconds, setEstimatedSeconds] = useState(null);
+  useEffect(() => {
+    const now = Date.now();
+    if (job.status !== "running" || job.processed === 0 || etaSample.current?.id !== job.id || !etaSample.current?.running) {
+      etaSample.current = { id: job.id, processed: job.processed, at: now, running: job.status === "running" };
+      setEstimatedSeconds(job.status === "completed" ? 0 : null);
+      return;
+    }
+    const sample = etaSample.current;
+    setEstimatedSeconds(estimateRemainingSeconds({ processed: job.processed - sample.processed, total: Math.max(0, job.total - sample.processed), elapsedMs: now - sample.at }));
+  }, [job.id, job.status, job.processed, job.total, job.duplicateCheckEstimate]);
 
   const busy = navigation.state === "submitting";
 
@@ -283,6 +296,11 @@ export default function JobProgress() {
             />
           </div>
         </div>
+
+        <p style={{ margin: 0, color: "#616161" }}>
+          {job.status === "paused" ? "Estimated remaining: paused; recalculates after resume." : ["failed", "cancelled"].includes(job.status) ? "Estimated remaining: job stopped." : job.processed === 0 && job.duplicateCheckEstimate ? job.duplicateCheckEstimate : `Estimated remaining: ${formatEstimatedTime(estimatedSeconds)}`}
+          {job.status === "running" && <span> · Approximate; adjusts with processing speed and Shopify throttling.</span>}
+        </p>
 
         {/* Job stats */}
         <div

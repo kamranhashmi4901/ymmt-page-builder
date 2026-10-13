@@ -8,9 +8,11 @@ import {
   useNavigation,
   useFetcher,
   useRevalidator,
+  useSearchParams,
 } from "react-router";
 
 import db from "../db.server";
+import { formatEstimatedTime } from "../lib/progress-eta";
 
 import { authenticate } from "../shopify.server";
 
@@ -20,6 +22,7 @@ import {
 } from "../lib/ymmt-uploads.server";
 
 import { getExistingPageHandles } from "../lib/shopify-pages.server";
+import { prepareReviewCheck, reviewCheckResult, reviewCheckView } from "../lib/review-check-jobs.server";
 
 import { buildYMMTPageHandle, buildYMMTPageTitle } from "../lib/ymmt-pages";
 
@@ -360,7 +363,7 @@ async function selectAllMatchingRecords({
 // Selection fetcher requests already return progress. Avoid rechecking every
 // selected Shopify handle after each 50-record batch. Revalidate once at the end.
 export function shouldRevalidate({ actionResult, defaultShouldRevalidate }) {
-  if (actionResult?.selection || actionResult?.selectionError) return false;
+  if (actionResult?.selection || actionResult?.selectionError || actionResult?.reviewCheckAction) return false;
   return defaultShouldRevalidate;
 }
 
@@ -369,7 +372,7 @@ export function shouldRevalidate({ actionResult, defaultShouldRevalidate }) {
 ========================================================= */
 
 export const loader = async ({ request }) => {
-  const { session, admin } = await authenticate.admin(request);
+  const { session } = await authenticate.admin(request);
 
   const url = new URL(request.url);
 
@@ -443,7 +446,9 @@ export const loader = async ({ request }) => {
     ),
   ];
 
-  const existingHandles = await getExistingPageHandles(admin, candidateHandles);
+  const check = await prepareReviewCheck(session.shop, uploadId, candidateHandles, url.searchParams.get("reviewCheck") || "");
+  if (check.status !== "completed") return { upload, filters, reviewCheck: reviewCheckView(check) };
+  const existingHandles = reviewCheckResult(check);
 
   const records = result.records.map((record) => {
     const proposals = buildRecordProposals(record, upload, existingHandles);
@@ -678,6 +683,66 @@ const tableCellStyle = {
 };
 
 export default function Review() {
+  const data = useLoaderData();
+  return data.reviewCheck ? <ReviewPreflight /> : <ReviewReady />;
+}
+
+function ReviewPreflight() {
+  const loaded = useLoaderData();
+  const worker = useFetcher(), poller = useFetcher(), revalidator = useRevalidator();
+  const [params, setParams] = useSearchParams();
+  const [auto, setAuto] = useState(true);
+  const reopened = useRef("");
+  let check = loaded.reviewCheck;
+  for (const candidate of [worker.data?.check, poller.data?.check]) {
+    if (candidate?.id === check.id && (candidate.revision > check.revision || (candidate.revision === check.revision && candidate.fetchedAt >= check.fetchedAt))) check = candidate;
+  }
+  const { submit } = worker, { load } = poller;
+  const workerState = worker.state, pollState = poller.state;
+  const id = check.id, status = check.status, busy = check.busy, revision = check.revision;
+  const error = worker.data?.error || check.error;
+  const savedId = params.get("reviewCheck");
+  useEffect(() => {
+    if (savedId === id) return;
+    setParams((previous) => { const next = new URLSearchParams(previous); next.set("reviewCheck", id); return next; }, { replace: true });
+  }, [savedId, id, setParams]);
+  useEffect(() => {
+    if (savedId !== id || !auto || status !== "running" || busy || error || workerState !== "idle") return;
+    const timer = setTimeout(() => submit({ intent: "advance" }, { method: "post", action: `/app/review-check/${id}` }), 400);
+    return () => clearTimeout(timer);
+  }, [savedId, auto, status, busy, error, workerState, id, revision, submit]);
+  useEffect(() => {
+    if ((status !== "running" && !busy) || pollState !== "idle") return;
+    const timer = setTimeout(() => load(`/app/review-check/${id}`), 1200);
+    return () => clearTimeout(timer);
+  }, [status, busy, pollState, id, revision, poller.data, load]);
+  useEffect(() => {
+    if (status !== "completed" || reopened.current === id) return;
+    reopened.current = id;
+    revalidator.revalidate();
+  }, [status, id, revalidator]);
+  const filterParams = new URLSearchParams({ uploadId: loaded.upload.id });
+  for (const [key, value] of Object.entries(loaded.filters)) if (value) filterParams.set(key, value);
+  return <s-page heading="Create YMMT Pages">
+    <s-section heading="Review · Checking existing pages">
+      <p>Checking proposed page handles for duplicates before showing your selection. This check reads Shopify pages; it does not create or update them.</p>
+      <progress max={check.total || 1} value={check.checked} style={{ width: "100%", height: "18px" }} />
+      <p role="status">{check.checked.toLocaleString()} / {check.total.toLocaleString()} handles checked ({check.progress}%) · {check.duplicates.toLocaleString()} existing pages · {check.requests} Shopify requests</p>
+      <p>Estimated remaining: {status === "failed" ? "Waiting for retry" : formatEstimatedTime(check.estimatedSeconds)}{check.estimatedSeconds > 0 ? " · Adjusts as batches finish and Shopify capacity changes." : ""}</p>
+      {error && <p role="alert" style={{ color: "#8a2e1b" }}>{error}</p>}
+      <div style={{ display: "flex", gap: "12px", alignItems: "center", flexWrap: "wrap", marginBottom: "16px" }}>
+        {status === "failed" || worker.data?.error ? <button type="button" disabled={workerState !== "idle" || busy} onClick={() => { setAuto(true); submit({ intent: "retry" }, { method: "post", action: `/app/review-check/${id}` }); }}>Retry duplicate check</button> : status === "running" && <button type="button" onClick={() => setAuto((previous) => !previous)}>{auto ? "Pause after this batch" : "Resume duplicate check"}</button>}
+        <Link to={`/app/filter?${filterParams.toString()}`}>Back to Filter & Preview</Link>
+      </div>
+      <div role="log" aria-live="polite" style={{ background: "#080808", color: "#eee", borderRadius: "10px", padding: "16px", maxHeight: "400px", overflow: "auto", overflowWrap: "anywhere", fontFamily: "monospace", fontSize: "12px", lineHeight: 1.8 }}>
+        {[...check.logs].reverse().map((entry, index) => <div key={`${entry.time}-${index}`} style={{ color: entry.level === "error" ? "#ff9b9b" : entry.level === "throttle" || entry.level === "wait" ? "#ffd479" : entry.level === "success" ? "#9ee6b1" : "#eee" }}>[{new Date(entry.time).toLocaleTimeString()}] {entry.message}</div>)}
+      </div>
+      <p style={{ color: "#616161", fontSize: "12px" }}>{status === "completed" ? "Duplicate check complete. Loading your review selection…" : !auto ? "Paused. Progress is saved; the current batch finishes first." : busy || workerState !== "idle" ? "A short lookup batch is running. Logs also show Shopify waits and retries." : "Preparing the next lookup batch."}</p>
+    </s-section>
+  </s-page>;
+}
+
+function ReviewReady() {
   const {
     upload,
     records,

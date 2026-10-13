@@ -6,253 +6,151 @@ export const loader = async ({ request }) => {
   return null;
 };
 
-const cardStyle = {
-  background: "#ffffff",
-  border: "1px solid #e3e3e3",
-  borderRadius: "14px",
-  padding: "22px",
-  minHeight: "190px",
-  display: "flex",
-  flexDirection: "column",
-  justifyContent: "space-between",
-};
+const groups = [
+  {
+    title: "Create pages",
+    pages: [
+      {
+        title: "Create YMMT Pages",
+        description:
+          "Upload vehicle data, choose a product, review your selection and create pages in bulk.",
+        to: "/app/upload",
+        action: "Start Creating",
+      },
+    ],
+  },
+  {
+    title: "Manage and correct pages",
+    pages: [
+      {
+        title: "Manage Pages",
+        description:
+          "Find pages using filters or corrected JSON, then select pages to update or delete.",
+        to: "/app/manage",
+        action: "Search Pages",
+      },
+      {
+        title: "Scan Pages",
+        description:
+          "Check for missing or incorrect vehicle values. View scan logs and export flagged pages as CSV or JSON.",
+        to: "/app/scan-pages",
+        action: "Open Scan Pages",
+      },
+      {
+        title: "Page Update Jobs",
+        description:
+          "Open saved updates, follow progress and logs, pause or resume, retry failures and download updated pages CSV.",
+        to: "/app/page-updates",
+        action: "View Update Jobs",
+      },
+      {
+        title: "Recent Change Sessions",
+        description:
+          "Review previous page updates, product handle changes and deletions, with links to each session’s details.",
+        to: "/app/change-sessions",
+        action: "View Change Sessions",
+      },
+    ],
+  },
+  {
+    title: "SEO and feeds",
+    pages: [
+      {
+        title: "SEO Meta",
+        description:
+          "Review and update SEO titles and descriptions for your YMMT pages.",
+        to: "/app/seo",
+        action: "Open SEO Meta",
+      },
+      {
+        title: "Google Feed",
+        description:
+          "Choose vehicle years, create an XML feed and download exports for Google Merchant Center.",
+        to: "/app/google-feed",
+        action: "Open Google Feed",
+      },
+    ],
+  },
+];
 
-const stepStyle = {
-  background: "#ffffff",
-  border: "1px solid #e3e3e3",
-  borderRadius: "10px",
-  padding: "14px 16px",
-  minWidth: "130px",
-  textAlign: "center",
-};
+const workflows = [
+  {
+    title: "Create new pages",
+    steps: [
+      "Upload data",
+      "Choose product",
+      "Filter and review",
+      "Create pages",
+      "Follow progress",
+    ],
+  },
+  {
+    title: "Correct existing pages",
+    steps: [
+      "Scan and export",
+      "Prepare corrected JSON",
+      "Search and select",
+      "Update and follow logs",
+      "Download updated CSV",
+    ],
+  },
+];
 
 export default function Index() {
-  const workflow = [
-    "Upload Data",
-    "Select Product",
-    "Filter & Preview",
-    "Review & Select",
-    "Create Pages",
-    "Progress & Logs",
-  ];
-
   return (
     <s-page heading="YMMT Page Builder">
-      <div
-        style={{
-          display: "flex",
-          flexDirection: "column",
-          gap: "24px",
-        }}
-      >
-        <div>
-          <s-heading>Vehicle Fitment Page Management</s-heading>
-
-          <div style={{ marginTop: "8px", maxWidth: "720px" }}>
-            <s-paragraph>
-              Create and manage Shopify YMMT fitment pages using your Year,
-              Make, Model and Trim compatibility data.
-            </s-paragraph>
-          </div>
-        </div>
-
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))",
-            gap: "18px",
-          }}
+      <style>{`
+        .ymmt-dashboard { display: grid; gap: 24px; }
+        .ymmt-dashboard h2 { font-size: 18px; margin: 0 0 12px; }
+        .ymmt-dashboard-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 14px; }
+        .ymmt-dashboard-card { background: #fff; border: 1px solid #e3e3e3; border-radius: 12px; padding: 20px; display: flex; flex-direction: column; align-items: flex-start; }
+        .ymmt-dashboard-card h3 { font-size: 16px; margin: 0; }
+        .ymmt-dashboard-card p { color: #616161; line-height: 1.5; margin: 8px 0 18px; flex: 1; }
+        .ymmt-dashboard-link { display: inline-block; background: #303030; color: #fff; text-decoration: none; padding: 10px 14px; border-radius: 8px; font-weight: 600; }
+        .ymmt-dashboard-link:hover { background: #484848; }
+        .ymmt-dashboard-link:focus-visible { outline: 3px solid #005bd3; outline-offset: 3px; }
+        .ymmt-dashboard-workflows { background: #fff; border: 1px solid #e3e3e3; border-radius: 12px; padding: 20px; display: grid; gap: 18px; }
+        .ymmt-dashboard-steps { display: flex; flex-wrap: wrap; gap: 8px; list-style: none; padding: 0; margin: 10px 0 0; }
+        .ymmt-dashboard-steps li { background: #f5f5f5; border-radius: 6px; padding: 8px 10px; }
+      `}</style>
+      <div className="ymmt-dashboard">
+        <p style={{ margin: 0, color: "#616161" }}>
+          Create, scan and correct vehicle fitment pages, then manage SEO and
+          Google Merchant Center feeds.
+        </p>
+        {groups.map((group) => (
+          <section key={group.title} aria-label={group.title}>
+            <h2>{group.title}</h2>
+            <div className="ymmt-dashboard-grid">
+              {group.pages.map((page) => (
+                <article className="ymmt-dashboard-card" key={page.to}>
+                  <h3>{page.title}</h3>
+                  <p>{page.description}</p>
+                  <Link className="ymmt-dashboard-link" to={page.to}>
+                    {page.action}
+                  </Link>
+                </article>
+              ))}
+            </div>
+          </section>
+        ))}
+        <section
+          className="ymmt-dashboard-workflows"
+          aria-label="Page workflows"
         >
-          <div style={cardStyle}>
-            <div>
-              <div
-                style={{
-                  fontSize: "18px",
-                  fontWeight: "650",
-                  marginBottom: "8px",
-                }}
-              >
-                Create YMMT Pages
-              </div>
-
-              <div
-                style={{
-                  color: "#616161",
-                  lineHeight: "1.5",
-                }}
-              >
-                Upload vehicle compatibility data, choose a product, filter the
-                records, review duplicates and create Shopify pages in bulk.
-              </div>
+          {workflows.map((workflow) => (
+            <div key={workflow.title}>
+              <strong>{workflow.title}</strong>
+              <ol className="ymmt-dashboard-steps">
+                {workflow.steps.map((step, index) => (
+                  <li key={step}>
+                    {index + 1}. {step}
+                  </li>
+                ))}
+              </ol>
             </div>
-
-            <div style={{ marginTop: "22px" }}>
-              <Link
-                to="/app/upload"
-                style={{
-                  display: "inline-block",
-                  background: "#303030",
-                  color: "#ffffff",
-                  textDecoration: "none",
-                  padding: "10px 16px",
-                  borderRadius: "8px",
-                  fontWeight: "600",
-                }}
-              >
-                Start Creating
-              </Link>
-            </div>
-          </div>
-
-          <div style={cardStyle}>
-            <div>
-              <div
-                style={{
-                  fontSize: "18px",
-                  fontWeight: "650",
-                  marginBottom: "8px",
-                }}
-              >
-                Manage Existing Pages
-              </div>
-
-              <div
-                style={{
-                  color: "#616161",
-                  lineHeight: "1.5",
-                }}
-              >
-                Search existing YMMT pages and manage bulk updates or deletions
-                from one place.
-              </div>
-            </div>
-
-            <div style={{ marginTop: "22px" }}>
-              <Link
-                to="/app/manage"
-                style={{
-                  display: "inline-block",
-                  background: "#ffffff",
-                  color: "#303030",
-                  textDecoration: "none",
-                  padding: "10px 16px",
-                  borderRadius: "8px",
-                  border: "1px solid #c9c9c9",
-                  fontWeight: "600",
-                }}
-              >
-                Manage Pages
-              </Link>
-            </div>
-          </div>
-        </div>
-
-        <s-section>
-          <span
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: "7px",
-            }}
-          >
-            <s-icon type="list-numbered" />
-            <strong>Page Creation Workflow</strong>
-          </span>
-          <div
-            style={{
-              display: "flex",
-              flexWrap: "wrap",
-              alignItems: "center",
-              gap: "10px",
-              marginTop: "10px",
-            }}
-          >
-            {workflow.map((step, index) => (
-              <div
-                key={step.label}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: "10px",
-                }}
-              >
-                <div style={stepStyle}>
-                  <div
-                    style={{
-                      fontSize: "12px",
-                      color: "#777",
-                      marginBottom: "4px",
-                    }}
-                  >
-                    STEP {index + 1}
-                  </div>
-
-                  <div style={{ fontWeight: "600" }}>{step}</div>
-                </div>
-
-                {index < workflow.length - 1 && (
-                  <div
-                    style={{
-                      color: "#888",
-                      fontSize: "18px",
-                    }}
-                  >
-                    →
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        </s-section>
-
-        <s-section>
-          <span
-            style={{
-              display: "inline-flex",
-              alignItems: "center",
-              gap: "7px",
-            }}
-          >
-            <s-icon type="shield-check-mark" />
-            <strong>Built-in Safety</strong>
-          </span>
-          <div
-            style={{
-              display: "grid",
-              gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))",
-              gap: "14px",
-              marginTop: "8px",
-            }}
-          >
-            <div>
-              <strong>Persistent YMMT Data</strong>
-              <div style={{ color: "#616161", marginTop: "4px" }}>
-                Uploaded vehicle records are stored in the app database.
-              </div>
-            </div>
-
-            <div>
-              <strong>Duplicate Detection</strong>
-              <div style={{ color: "#616161", marginTop: "4px" }}>
-                Existing Shopify page handles are checked before creation.
-              </div>
-            </div>
-
-            <div>
-              <strong>Job Progress & Logs</strong>
-              <div style={{ color: "#616161", marginTop: "4px" }}>
-                Bulk jobs show progress, created, skipped and failed pages.
-              </div>
-            </div>
-
-            <div>
-              <strong>Pause / Resume / Cancel</strong>
-              <div style={{ color: "#616161", marginTop: "4px" }}>
-                Long-running creation jobs can be controlled from the app.
-              </div>
-            </div>
-          </div>
-        </s-section>
+          ))}
+        </section>
       </div>
     </s-page>
   );
